@@ -85,9 +85,13 @@ pub fn compile_with(
     let t = std::time::Instant::now();
     let cached = so.exists();
     if !cached {
-        let c = dir.join(format!("k{key}.{ext}"));
+        // Per-process and per-thread names: concurrent builds of the same
+        // source must not read each other's half-written files.
+        let tag = format!("{}.{:?}", std::process::id(), std::thread::current().id())
+            .replace(|c: char| !c.is_ascii_alphanumeric() && c != '.', "");
+        let c = dir.join(format!("k{key}.{tag}.{ext}"));
         std::fs::write(&c, src).map_err(|e| e.to_string())?;
-        let tmp = dir.join(format!("k{key}.{}.tmp.so", std::process::id()));
+        let tmp = dir.join(format!("k{key}.{tag}.tmp.so"));
         let out = std::process::Command::new(cc)
             .args(flags)
             .arg("-o")

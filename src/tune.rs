@@ -190,7 +190,9 @@ fn harness(plan: &Plan, args: &[Arg]) -> Harness {
                 (Arg::Packed { k, n, nr, .. }, None) => {
                     (0..n.div_ceil(*nr) * k * nr).map(|_| rnd()).collect()
                 }
-                (Arg::PackedHalf { .. }, None) => unreachable!("fp16 operands are GPU-only"),
+                (Arg::PackedHalf { .. } | Arg::Workspace, None) => {
+                    unreachable!("GPU-only operands")
+                }
             })
             .collect();
         sets.push(set);

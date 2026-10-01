@@ -103,6 +103,8 @@ struct Launch {
     name: String,
     /// A fused attention kernel.
     fused: bool,
+    /// A second kernel on the same arguments (split-K's reduction).
+    then: Option<(usize, [u32; 3], u32)>,
 }
 
 enum GStep {
@@ -201,7 +203,19 @@ pub struct Generated {
     /// Function name of each kernel step.
     pub names: Vec<String>,
     pub unique: Vec<String>,
+    /// Second kernels (split-K reductions), named `<kernel>_r`.
+    pub then_names: Vec<String>,
     pub source: String,
+}
+
+impl Generated {
+    /// Every function to load: the kernels, the gather, the second kernels.
+    pub fn functions(&self) -> Vec<String> {
+        let mut v = self.unique.clone();
+        v.push("kgather".into());
+        v.extend(self.then_names.iter().cloned());
+        v
+    }
 }
 
 pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
@@ -239,6 +253,8 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
                 src: String::new(),
                 args: Vec::new(),
                 outs: Vec::new(),
+                then: None,
+                ws: 0,
                 grid: [0, 0, 0],
                 block: 0,
                 smem: 0,
@@ -265,6 +281,7 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
     let mut source = String::from(codegen::PRELUDE);
     source.push_str(codegen::GATHER);
     let mut names = Vec::new();
+    let mut then_names = Vec::new();
     for k in &kernels {
         if k.src.is_empty() {
             names.push(String::new());
@@ -277,6 +294,9 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
                 source.push('\n');
                 source.push_str(&k.src.replace("KNAME", &n));
                 unique.push(n.clone());
+                if k.then.is_some() {
+                    then_names.push(format!("{n}_r"));
+                }
                 n
             })
             .clone();
@@ -286,6 +306,7 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
         kernels,
         names,
         unique,
+        then_names,
         source,
     }
 }
@@ -349,16 +370,14 @@ impl GpuExecutable {
                 let nv = Nvrtc::open()?;
                 let arch = (c.cc.0 * 10 + c.cc.1) as u32;
                 let (bin, cached) = compile_cubin(&nv, &gn.source, arch)?;
-                let mut names = gn.unique.clone();
-                names.push("kgather".into());
-                let fs = c.load(&bin, &names)?;
+                let fs = c.load(&bin, &gn.functions())?;
                 (Funcs::Cuda(fs), cached)
             }
             Dev::Emu(_) => {
                 let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
                 let lib = jit::compile_with(&cxx, EMU_FLAGS, &["-lm"], "cpp", &gn.source)?;
                 let mut fs = Vec::new();
-                for n in gn.unique.iter().map(String::as_str).chain(["kgather"]) {
+                for n in &gn.functions() {
                     let p = lib.symbol(&format!("{n}_emu"))?;
                     // SAFETY: every emulator entry point has this signature.
                     fs.push(unsafe { std::mem::transmute::<*mut std::ffi::c_void, EmuFn>(p) });
@@ -383,6 +402,15 @@ impl GpuExecutable {
             .collect();
         let (offsets, total, naive) = arena_layout(&plan, &kargs);
         let arena = dev.alloc(total.max(16))?;
+        // One workspace serves every split-K matmul (they run one at a time).
+        let ws_floats = gn.kernels.iter().map(|k| k.ws).max().unwrap_or(0);
+        let workspace = if ws_floats > 0 {
+            dev.alloc(ws_floats)?
+        } else {
+            0
+        };
+        let functions = gn.functions();
+        let fidx = |n: &str| functions.iter().position(|f| f == n).unwrap();
         let g = &plan.g;
         let mut consts: HashMap<usize, DevPtr> = HashMap::new();
         let mut packed: HashMap<(usize, crate::ir::Lin), DevPtr> = HashMap::new();
@@ -436,6 +464,7 @@ impl GpuExecutable {
                                 ],
                                 name: "kgather".into(),
                                 fused: false,
+                                then: None,
                             },
                             dim: t.shape[0] as i64,
                         });
@@ -452,6 +481,7 @@ impl GpuExecutable {
                     let mut args = Vec::new();
                     for a in &gk.args {
                         args.push(match a {
+                            Arg::Workspace => workspace,
                             Arg::Value(v) => {
                                 if let Some(t) = g.konst(*v) {
                                     match consts.get(v) {
@@ -530,7 +560,8 @@ impl GpuExecutable {
                         });
                     }
                     steps.push(GStep::Kernel(Launch {
-                        func: gn.unique.iter().position(|n| n == name).unwrap(),
+                        func: fidx(name),
+                        then: gk.then.map(|(g, b)| (fidx(&format!("{name}_r")), g, b)),
                         grid: gk.grid,
                         block: gk.block,
                         smem: gk.smem,
@@ -570,24 +601,28 @@ impl GpuExecutable {
     }
 
     fn launch(&self, l: &Launch) -> Result<(), String> {
+        self.launch_one(l.func, l.grid, l.block, l.smem, &l.args)?;
+        if let Some((f, grid, block)) = l.then {
+            self.launch_one(f, grid, block, 0, &l.args)?;
+        }
+        Ok(())
+    }
+
+    fn launch_one(
+        &self,
+        func: usize,
+        grid: [u32; 3],
+        block: u32,
+        smem: u32,
+        args: &[DevPtr],
+    ) -> Result<(), String> {
         match (&self.dev, &self.funcs) {
-            (Dev::Cuda(c), Funcs::Cuda(fs)) => {
-                c.launch(fs[l.func], l.grid, l.block, l.smem, &l.args)
-            }
+            (Dev::Cuda(c), Funcs::Cuda(fs)) => c.launch(fs[func], grid, block, smem, args),
             (Dev::Emu(_), Funcs::Emu(fs, _)) => {
-                let mut ptrs: Vec<*mut f32> = l.args.iter().map(|&a| a as *mut f32).collect();
+                let mut ptrs: Vec<*mut f32> = args.iter().map(|&a| a as *mut f32).collect();
                 // SAFETY: the arguments are emulated device buffers matching
                 // the kernel's parameters.
-                unsafe {
-                    fs[l.func](
-                        ptrs.as_mut_ptr(),
-                        l.grid[0],
-                        l.grid[1],
-                        l.grid[2],
-                        l.block,
-                        l.smem,
-                    )
-                };
+                unsafe { fs[func](ptrs.as_mut_ptr(), grid[0], grid[1], grid[2], block, smem) };
                 Ok(())
             }
             _ => unreachable!(),

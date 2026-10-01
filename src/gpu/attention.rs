@@ -490,6 +490,8 @@ pub fn attention_kernel(
         grid: [m.div_ceil(bm) as u32, batch as u32, 1],
         block: nt as u32,
         smem: (floats * 4) as u32,
+        then: None,
+        ws: 0,
     })
 }
 

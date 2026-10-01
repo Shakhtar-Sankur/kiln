@@ -124,7 +124,11 @@ fn gpu_kernels_match_pytorch_under_every_schedule() {
                         let mut i = round * 7;
                         for s in &plan.steps {
                             if let Step::Kernel(Kernel::Matmul(mk)) = s {
-                                let p: MmParams = space[i % space.len()];
+                                // And split-K over 1 to 3 slices.
+                                let p = MmParams {
+                                    ks: 1 + (i / 3 + round) % 3,
+                                    ..space[i % space.len()]
+                                };
                                 opts.mm.insert(mm_key(mk, half), p);
                                 i += 3;
                             }
@@ -178,7 +182,21 @@ fn gpu_kernels_compile_for_t4_and_a100() {
             kiln::gpu::generate(&plan, &GpuOptions::new(Device::Cuda), 40).source,
             kiln::gpu::generate(&plan, &half, 40).source,
         ];
-        for p in mm_space(false).into_iter().chain(mm_space(true)) {
+        let split = [
+            MmParams {
+                ks: 2,
+                ..mm_space(false)[0]
+            },
+            MmParams {
+                ks: 3,
+                ..mm_space(true)[0]
+            },
+        ];
+        for p in mm_space(false)
+            .into_iter()
+            .chain(mm_space(true))
+            .chain(split)
+        {
             let mut o = GpuOptions::new(Device::Cuda);
             o.half = p.tc;
             for s in &plan.steps {

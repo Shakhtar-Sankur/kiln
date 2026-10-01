@@ -393,8 +393,8 @@ impl Executable {
                                 });
                                 packed[id].as_ptr() as *mut f32
                             }
-                            Arg::PackedHalf { .. } => {
-                                return Err("an fp16 operand in a CPU kernel".into());
+                            Arg::PackedHalf { .. } | Arg::Workspace => {
+                                return Err("a GPU-only operand in a CPU kernel".into());
                             }
                         };
                         args.push(ptr);

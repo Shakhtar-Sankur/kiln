@@ -23,6 +23,8 @@ pub enum Arg {
         n: usize,
         nr: usize,
     },
+    /// The device workspace of split-K partial sums (GPU only).
+    Workspace,
     /// A constant matmul operand as fp16, transposed: element (k, j) at
     /// j·K + k (the GPU's tensor-core kernels).
     PackedHalf {

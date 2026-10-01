@@ -49,12 +49,21 @@ pub struct GpuKernel {
     pub grid: [u32; 3],
     pub block: u32,
     pub smem: u32,
+    /// A second kernel `KNAME_r` launched right after with the same
+    /// arguments (split-K's reduction): its grid and block.
+    pub then: Option<([u32; 3], u32)>,
+    /// Floats of workspace the kernel needs (split-K partial sums).
+    pub ws: usize,
 }
 
 /// Matmul schedule: a BM x BN block tile staged BK deep. With `tc` false
 /// (fp32 on CUDA cores) each thread holds a TM x TN register tile; with
 /// `tc` (fp16 tensor cores) TM x TN is the grid of warps, each computing a
-/// (BM/TM) x (BN/TN) warp tile out of 16 x 8 mma tiles.
+/// (BM/TM) x (BN/TN) warp tile out of 16 x 8 mma tiles. `ks` > 1 splits
+/// the reduction over that many blocks, whose partial sums a second kernel
+/// adds before the epilogue. `vec` (fp32) gives each thread contiguous
+/// rows and columns, read from shared memory 16 bytes at a time, instead
+/// of rows and columns interleaved across the block.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MmParams {
     pub bm: usize,
@@ -63,6 +72,8 @@ pub struct MmParams {
     pub tm: usize,
     pub tn: usize,
     pub tc: bool,
+    pub ks: usize,
+    pub vec: bool,
 }
 
 impl MmParams {
@@ -74,9 +85,25 @@ impl MmParams {
         }
     }
 
-    fn valid(&self) -> bool {
+    pub fn new(bm: usize, bn: usize, bk: usize, tm: usize, tn: usize, tc: bool) -> MmParams {
+        MmParams {
+            bm,
+            bn,
+            bk,
+            tm,
+            tn,
+            tc,
+            ks: 1,
+            vec: false,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
         let t = self.threads();
-        if !(32..=256).contains(&t) {
+        if !(32..=256).contains(&t) || self.ks == 0 {
+            return false;
+        }
+        if self.vec && (self.tc || !self.tm.is_multiple_of(4) || !self.tn.is_multiple_of(4)) {
             return false;
         }
         if self.tc {
@@ -129,16 +156,13 @@ pub fn mm_space(tc: bool) -> Vec<MmParams> {
     let bks: &[usize] = if tc { &[16, 32, 64] } else { &[8, 16, 32] };
     for &(bm, bn, tm, tn) in tiles {
         for &bk in bks {
-            let p = MmParams {
-                bm,
-                bn,
-                bk,
-                tm,
-                tn,
-                tc,
-            };
+            let p = MmParams::new(bm, bn, bk, tm, tn, tc);
             if p.valid() {
                 v.push(p);
+            }
+            let q = MmParams { vec: true, ..p };
+            if q.valid() {
+                v.push(q);
             }
         }
     }
@@ -169,14 +193,7 @@ pub fn default_mm(mk: &MatmulK, sms: usize, tc: bool) -> MmParams {
     let bk = if tc { 32 } else { 16 };
     let mut last = None;
     for &(bm, bn, tm, tn) in order {
-        let p = MmParams {
-            bm,
-            bn,
-            bk,
-            tm,
-            tn,
-            tc,
-        };
+        let p = MmParams::new(bm, bn, bk, tm, tn, tc);
         last = Some(p);
         if tiles(&p) >= 2 * sms {
             return p;
@@ -323,23 +340,31 @@ pub(crate) fn collect_args(exprs: &[&E], outs: &[usize]) -> (Vec<Arg>, HashMap<u
 /// The kernel signature (outputs writable, inputs read-only) and, for the
 /// emulator, an entry point `KNAME_emu` taking the arguments as an array.
 pub(crate) fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
+    signature_named(threads, args, nout, "KNAME")
+}
+
+pub(crate) fn signature_named(threads: usize, args: &[Arg], nout: usize, name: &str) -> String {
     let params: Vec<String> = args
         .iter()
         .enumerate()
         .map(|(i, a)| {
             if matches!(a, Arg::PackedHalf { .. }) {
                 format!("const khalf *__restrict__ b{i}")
-            } else if i < nout {
+            } else if i < nout || matches!(a, Arg::Workspace) {
                 format!("float *__restrict__ b{i}")
             } else {
                 format!("const float *__restrict__ b{i}")
             }
         })
         .collect();
-    format!("KGLOBAL({threads}) KNAME({})", params.join(", "))
+    format!("KGLOBAL({threads}) {name}({})", params.join(", "))
 }
 
 pub(crate) fn emu_entry(args: &[Arg]) -> String {
+    emu_entry_named(args, "KNAME")
+}
+
+pub(crate) fn emu_entry_named(args: &[Arg], name: &str) -> String {
     let call: Vec<String> = args
         .iter()
         .enumerate()
@@ -352,7 +377,7 @@ pub(crate) fn emu_entry(args: &[Arg]) -> String {
         })
         .collect();
     format!(
-        "#ifndef KILN_CUDA\nstatic void KNAME_body(float **A) {{ KNAME({}); }}\nextern \"C\" void KNAME_emu(float **A, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned smem) {{ kemu_launch(KNAME_body, A, gx, gy, gz, bx, 1, smem); }}\n#endif\n",
+        "#ifndef KILN_CUDA\nstatic void {name}_body(float **A) {{ {name}({}); }}\nextern \"C\" void {name}_emu(float **A, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned smem) {{ kemu_launch({name}_body, A, gx, gy, gz, bx, 1, smem); }}\n#endif\n",
         call.join(", ")
     )
 }
@@ -562,6 +587,8 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
             grid: [total.div_ceil(threads) as u32, 1, 1],
             block: threads as u32,
             smem: 0,
+            then: None,
+            ws: 0,
         };
     }
     let tpr = tpr.unwrap_or_else(|| default_tpr(width));
@@ -612,6 +639,8 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
         grid: [rows.div_ceil(rpb) as u32, 1, 1],
         block: threads as u32,
         smem: smem as u32,
+        then: None,
+        ws: 0,
     }
 }
 
@@ -761,9 +790,11 @@ struct MmCommon {
     map: HashMap<usize, usize>,
     packed: Option<usize>,
     batch: usize,
+    /// The workspace argument (split-K).
+    ws: Option<usize>,
 }
 
-fn mm_common(mk: &MatmulK, half: bool) -> MmCommon {
+fn mm_common(mk: &MatmulK, half: bool, ks: usize) -> MmCommon {
     let mut exprs: Vec<&E> = vec![&mk.a, &mk.epi];
     exprs.extend(mk.lets.iter().map(|l| &l.1));
     if let BOp::Expr(e) = &mk.b {
@@ -792,12 +823,81 @@ fn mm_common(mk: &MatmulK, half: bool) -> MmCommon {
         }
         BOp::Expr(_) => None,
     };
+    let ws = (ks > 1).then(|| {
+        args.push(Arg::Workspace);
+        args.len() - 1
+    });
     MmCommon {
         args,
         map,
         packed,
         batch: mk.batch.iter().map(|b| b.1).product(),
+        ws,
     }
+}
+
+/// The block's batch entry and range of the reduction: all of it, or with
+/// split-K the kz-th of `ks` slices (whole BK tiles, so a tile never
+/// straddles two slices).
+fn split_head(p: &MmParams, kk: usize, bm: usize, bn: usize) -> String {
+    let mut s = format!("  const int m0 = blockIdx.y * {bm}, n0 = blockIdx.x * {bn};\n");
+    if p.ks > 1 {
+        let kc = kk.div_ceil(p.ks).div_ceil(p.bk) * p.bk;
+        let _ = writeln!(
+            s,
+            "  const int kz = blockIdx.z % {ks}, tb = blockIdx.z / {ks};\n  const int kbeg = kz * {kc}, kend = kbeg + {kc} < {kk} ? kbeg + {kc} : {kk};",
+            ks = p.ks
+        );
+    } else {
+        let _ = writeln!(s, "  const int tb = blockIdx.z, kbeg = 0, kend = {kk};");
+    }
+    s
+}
+
+/// The epilogue body for accumulator `acc` at (_i, _j): the fused store,
+/// or (split-K) the partial sum into the workspace.
+fn mm_store(
+    mk: &MatmulK,
+    gx: &Gx,
+    map: &HashMap<usize, usize>,
+    c: &MmCommon,
+    indent: &str,
+) -> String {
+    match c.ws {
+        Some(w) => format!(
+            "{indent}b{w}[((kz * {} + tb) * {} + _i) * {} + _j] = acc;\n",
+            c.batch, mk.m, mk.n
+        ),
+        None => epilogue(mk, gx, map, indent),
+    }
+}
+
+/// Split-K's second kernel: one thread per output element sums the
+/// partials, then runs the epilogue.
+fn reduce_kernel(mk: &MatmulK, p: &MmParams, gx: &Gx, c: &MmCommon) -> (String, [u32; 3]) {
+    let (m, n) = (mk.m, mk.n);
+    let total = c.batch * m * n;
+    let w = c.ws.unwrap();
+    let mut s = String::new();
+    let _ = writeln!(s, "{} {{", signature_named(256, &c.args, 1, "KNAME_r"));
+    let _ = writeln!(s, "  const int e = blockIdx.x * 256 + threadIdx.x;");
+    let _ = writeln!(s, "  if (e >= {total}) return;");
+    let _ = writeln!(
+        s,
+        "  const int _j = e % {n}, _i = (e / {n}) % {m}, tb = e / {};",
+        m * n
+    );
+    s.push_str(&decode(&mk.batch, "tb", "  "));
+    let _ = writeln!(s, "  float acc = 0.0f;");
+    let _ = writeln!(
+        s,
+        "  for (int z = 0; z < {}; z++) acc += b{w}[((z * {} + tb) * {m} + _i) * {n} + _j];",
+        p.ks, c.batch
+    );
+    s.push_str(&epilogue(mk, gx, &c.map, "  "));
+    s.push_str("}\n");
+    s.push_str(&emu_entry_named(&c.args, "KNAME_r"));
+    (s, [total.div_ceil(256) as u32, 1, 1])
 }
 
 pub(crate) fn mm_names(mk: &MatmulK) -> HashMap<Var, String> {
@@ -851,12 +951,8 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     if p.tc {
         return tc_matmul_kernel(mk, p);
     }
-    let MmCommon {
-        args,
-        map,
-        packed,
-        batch,
-    } = mm_common(mk, false);
+    let common = mm_common(mk, false, p.ks);
+    let (args, map, packed, batch) = (&common.args, &common.map, common.packed, common.batch);
     let (m, n, kk) = (mk.m, mk.n, mk.k);
     let MmParams {
         bm, bn, bk, tm, tn, ..
@@ -864,12 +960,20 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     let (sx, sy) = (bn / tn, bm / tm);
     let nt = sx * sy;
     let gx = Gx {
-        args: &map,
+        args: map,
         names: mm_names(mk),
         acc: Some("acc".into()),
         temps: true,
     };
-    let lda = bm + 1;
+    // Interleaved: thread (tx, ty) owns rows ty + r·SY and columns tx + q·SX
+    // (broadcast and conflict-free reads, coalesced stores). Vectorized:
+    // rows ty·TM + r and columns tx·TN + q, read 16 bytes at a time, with
+    // rows padded to keep them 16-byte aligned.
+    let (lda, ldb) = if p.vec {
+        (bm + 4, bn + 4)
+    } else {
+        (bm + 1, bn)
+    };
     let ta = a_tile(mk, &gx, bm, bk, nt);
     // B tile (BK x BN), 4-wide along j when contiguous in j.
     let bload = match (&mk.b, packed) {
@@ -893,7 +997,7 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         nt,
     };
     let mut s = String::new();
-    let _ = writeln!(s, "{} {{", signature(nt, &args, 1));
+    let _ = writeln!(s, "{} {{", signature(nt, args, 1));
     s.push_str("  SMEM;\n");
     let _ = writeln!(
         s,
@@ -904,10 +1008,7 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         s,
         "  const int tid = threadIdx.x, tx = tid % {sx}, ty = tid / {sx};"
     );
-    let _ = writeln!(
-        s,
-        "  const int m0 = blockIdx.y * {bm}, n0 = blockIdx.x * {bn}, tb = blockIdx.z;"
-    );
+    s.push_str(&split_head(&p, kk, bm, bn));
     s.push_str(&decode(&mk.batch, "tb", "  "));
     let _ = writeln!(s, "  float c[{tm}][{tn}];");
     let _ = writeln!(
@@ -916,17 +1017,17 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     s.push_str(&ta.decl());
     s.push_str(&tb.decl());
-    s.push_str("  {\n    const int kn = 0;\n");
+    s.push_str("  {\n    const int kn = kbeg;\n");
     s.push_str(&ta.load_code());
     s.push_str(&tb.load_code());
     s.push_str("  }\n");
-    let _ = writeln!(s, "  for (int k0 = 0; k0 < {kk}; k0 += {bk}) {{");
+    let _ = writeln!(s, "  for (int k0 = kbeg; k0 < kend; k0 += {bk}) {{");
     s.push_str(&ta.store_code(&|r, k, v| format!("As[({k}) * {lda} + {r}] = {v};"), None));
-    s.push_str(&tb.store_code(&|r, k, v| format!("Bs[({k}) * {bn} + {r}] = {v};"), None));
+    s.push_str(&tb.store_code(&|r, k, v| format!("Bs[({k}) * {ldb} + {r}] = {v};"), None));
     s.push_str("    KSYNC();\n");
     let _ = writeln!(
         s,
-        "    if (k0 + {bk} < {kk}) {{\n    const int kn = k0 + {bk};"
+        "    if (k0 + {bk} < kend) {{\n    const int kn = k0 + {bk};"
     );
     s.push_str(&ta.load_code());
     s.push_str(&tb.load_code());
@@ -936,14 +1037,25 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         "    #pragma unroll\n    for (int kk = 0; kk < {bk}; kk++) {{"
     );
     let _ = writeln!(s, "      float a[{tm}], w[{tn}];");
-    let _ = writeln!(
-        s,
-        "      #pragma unroll\n      for (int r = 0; r < {tm}; r++) a[r] = As[kk * {lda} + ty + r * {sy}];"
-    );
-    let _ = writeln!(
-        s,
-        "      #pragma unroll\n      for (int q = 0; q < {tn}; q++) w[q] = Bs[kk * {bn} + tx + q * {sx}];"
-    );
+    if p.vec {
+        let _ = writeln!(
+            s,
+            "      #pragma unroll\n      for (int r = 0; r < {tm}; r += 4) {{ const kf4 v = kld4(As + kk * {lda} + ty * {tm} + r); a[r] = v.x; a[r + 1] = v.y; a[r + 2] = v.z; a[r + 3] = v.w; }}"
+        );
+        let _ = writeln!(
+            s,
+            "      #pragma unroll\n      for (int q = 0; q < {tn}; q += 4) {{ const kf4 v = kld4(Bs + kk * {ldb} + tx * {tn} + q); w[q] = v.x; w[q + 1] = v.y; w[q + 2] = v.z; w[q + 3] = v.w; }}"
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "      #pragma unroll\n      for (int r = 0; r < {tm}; r++) a[r] = As[kk * {lda} + ty + r * {sy}];"
+        );
+        let _ = writeln!(
+            s,
+            "      #pragma unroll\n      for (int q = 0; q < {tn}; q++) w[q] = Bs[kk * {ldb} + tx + q * {sx}];"
+        );
+    }
     let _ = writeln!(
         s,
         "      #pragma unroll\n      for (int r = 0; r < {tm}; r++)\n        #pragma unroll\n        for (int q = 0; q < {tn}; q++) c[r][q] += a[r] * w[q];"
@@ -953,23 +1065,36 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         s,
         "  #pragma unroll\n  for (int r = 0; r < {tm}; r++)\n    #pragma unroll\n    for (int q = 0; q < {tn}; q++) {{"
     );
-    let _ = writeln!(
-        s,
-        "      const int _i = m0 + ty + r * {sy}, _j = n0 + tx + q * {sx};"
-    );
+    if p.vec {
+        let _ = writeln!(
+            s,
+            "      const int _i = m0 + ty * {tm} + r, _j = n0 + tx * {tn} + q;"
+        );
+    } else {
+        let _ = writeln!(
+            s,
+            "      const int _i = m0 + ty + r * {sy}, _j = n0 + tx + q * {sx};"
+        );
+    }
     let _ = writeln!(s, "      if (_i < {m} && _j < {n}) {{");
     s.push_str("        const float acc = c[r][q];\n");
-    s.push_str(&epilogue(mk, &gx, &map, "        "));
+    s.push_str(&mm_store(mk, &gx, map, &common, "        "));
     s.push_str("      }\n    }\n}\n");
-    s.push_str(&emu_entry(&args));
-    GpuKernel {
-        src: s,
-        args,
-        outs: vec![mk.out],
-        grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
-        block: nt as u32,
-        smem: ((bk * lda + bk * bn) * 4) as u32,
-    }
+    s.push_str(&emu_entry(args));
+    finish_mm(
+        mk,
+        &p,
+        &gx,
+        &common,
+        s,
+        [
+            n.div_ceil(bn) as u32,
+            m.div_ceil(bm) as u32,
+            (batch * p.ks) as u32,
+        ],
+        nt,
+        (bk * lda + bk * ldb) * 4,
+    )
 }
 
 /// The matmul on tensor cores: operands converted to fp16 as they are
@@ -978,12 +1103,8 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
 /// mma.m16n8k8. Both tiles keep k contiguous with rows padded to BK + 8
 /// halves, so the fragment loads of a warp hit 32 distinct banks.
 fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
-    let MmCommon {
-        args,
-        map,
-        packed,
-        batch,
-    } = mm_common(mk, true);
+    let common = mm_common(mk, true, p.ks);
+    let (args, map, packed, batch) = (&common.args, &common.map, common.packed, common.batch);
     let (m, n, kk) = (mk.m, mk.n, mk.k);
     let MmParams {
         bm, bn, bk, tm, tn, ..
@@ -993,7 +1114,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     let threads = p.threads();
     let ldk = bk + 8;
     let gx = Gx {
-        args: &map,
+        args: map,
         names: mm_names(mk),
         acc: Some("acc".into()),
         temps: true,
@@ -1029,7 +1150,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         nt: threads,
     };
     let mut s = String::new();
-    let _ = writeln!(s, "{} {{", signature(threads, &args, 1));
+    let _ = writeln!(s, "{} {{", signature(threads, args, 1));
     s.push_str("  SMEM;\n");
     let _ = writeln!(
         s,
@@ -1038,10 +1159,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     s.push_str("  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, g = lane / 4, t4 = lane % 4;\n");
     let _ = writeln!(s, "  const int wy = warp / {tn}, wx = warp % {tn};");
-    let _ = writeln!(
-        s,
-        "  const int m0 = blockIdx.y * {bm}, n0 = blockIdx.x * {bn}, tb = blockIdx.z;"
-    );
+    s.push_str(&split_head(&p, kk, bm, bn));
     s.push_str(&decode(&mk.batch, "tb", "  "));
     let _ = writeln!(s, "  float c[{mt}][{nt}][4];");
     let _ = writeln!(
@@ -1050,11 +1168,11 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     s.push_str(&ta.decl());
     s.push_str(&tb.decl());
-    s.push_str("  {\n    const int kn = 0;\n");
+    s.push_str("  {\n    const int kn = kbeg;\n");
     s.push_str(&ta.load_code());
     s.push_str(&tb.load_code());
     s.push_str("  }\n");
-    let _ = writeln!(s, "  for (int k0 = 0; k0 < {kk}; k0 += {bk}) {{");
+    let _ = writeln!(s, "  for (int k0 = kbeg; k0 < kend; k0 += {bk}) {{");
     let ast = |r: &str, k: &str, v: &str| format!("As[({r}) * {ldk} + {k}] = kf2h({v});");
     let avec = |v: &str| format!("kst4h(As + rr * {ldk} + kk, {v});");
     s.push_str(&ta.store_code(&ast, Some(&avec)));
@@ -1067,7 +1185,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     s.push_str("    KSYNC();\n");
     let _ = writeln!(
         s,
-        "    if (k0 + {bk} < {kk}) {{\n    const int kn = k0 + {bk};"
+        "    if (k0 + {bk} < kend) {{\n    const int kn = k0 + {bk};"
     );
     s.push_str(&ta.load_code());
     s.push_str(&tb.load_code());
@@ -1100,15 +1218,54 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     let _ = writeln!(s, "        if (_i < {m} && _j < {n}) {{");
     s.push_str("          const float acc = c[x][y][i];\n");
-    s.push_str(&epilogue(mk, &gx, &map, "          "));
+    s.push_str(&mm_store(mk, &gx, map, &common, "          "));
     s.push_str("        }\n      }\n}\n");
-    s.push_str(&emu_entry(&args));
+    s.push_str(&emu_entry(args));
+    finish_mm(
+        mk,
+        &p,
+        &gx,
+        &common,
+        s,
+        [
+            n.div_ceil(bn) as u32,
+            m.div_ceil(bm) as u32,
+            (batch * p.ks) as u32,
+        ],
+        threads,
+        (bm + bn) * ldk * 2,
+    )
+}
+
+/// The kernel, with split-K's reduction kernel appended.
+#[allow(clippy::too_many_arguments)]
+fn finish_mm(
+    mk: &MatmulK,
+    p: &MmParams,
+    gx: &Gx,
+    c: &MmCommon,
+    mut src: String,
+    grid: [u32; 3],
+    threads: usize,
+    smem: usize,
+) -> GpuKernel {
+    let then = (p.ks > 1).then(|| {
+        let (r, rgrid) = reduce_kernel(mk, p, gx, c);
+        src.push_str(&r);
+        (rgrid, 256)
+    });
     GpuKernel {
-        src: s,
-        args,
+        src,
+        args: c.args.clone(),
         outs: vec![mk.out],
-        grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
+        grid,
         block: threads as u32,
-        smem: ((bm + bn) * ldk * 2) as u32,
+        smem: smem as u32,
+        then,
+        ws: if p.ks > 1 {
+            p.ks * c.batch * mk.m * mk.n
+        } else {
+            0
+        },
     }
 }
