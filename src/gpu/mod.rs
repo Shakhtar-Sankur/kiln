@@ -6,6 +6,7 @@
 //! kernel source as C++ against a model of CUDA's execution model, so the
 //! kernels are tested without a GPU.
 
+pub mod attention;
 pub mod codegen;
 pub mod driver;
 pub mod tune;
@@ -39,6 +40,8 @@ pub struct GpuOptions {
     /// Matmuls on fp16 tensor cores (fp32 accumulation; everything else
     /// stays fp32).
     pub half: bool,
+    /// Fuse scores, softmax and output matmul into one kernel.
+    pub attention: bool,
 }
 
 /// The schedule table key of a matmul: its signature, and the precision.
@@ -55,6 +58,7 @@ impl GpuOptions {
             tpr: None,
             graphs: true,
             half: false,
+            attention: true,
         }
     }
 }
@@ -92,10 +96,14 @@ struct Launch {
     smem: u32,
     args: Vec<DevPtr>,
     name: String,
+    /// A fused attention kernel.
+    fused: bool,
 }
 
 enum GStep {
     Kernel(Launch),
+    /// A kernel step absorbed into a fused kernel.
+    Nop,
     Host(usize),
     /// A host Gather of rows of a constant f32 table, done on the device:
     /// only the indices are uploaded.
@@ -193,7 +201,41 @@ pub struct Generated {
 
 pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
     let mut kernels = Vec::new();
-    for step in &plan.steps {
+    // Fused attention: the first step of each pattern gets the fused
+    // kernel, the other two none.
+    let mut fused: HashMap<usize, GpuKernel> = HashMap::new();
+    let mut skip = std::collections::HashSet::new();
+    if opts.attention {
+        for [a, b, c] in attention::find(plan) {
+            if let (
+                Step::Kernel(Kernel::Matmul(m1)),
+                Step::Kernel(Kernel::Loop(lk)),
+                Step::Kernel(Kernel::Matmul(m3)),
+            ) = (&plan.steps[a], &plan.steps[b], &plan.steps[c])
+                && let Some(k) = attention::attention_kernel(m1, lk, m3)
+            {
+                fused.insert(a, k);
+                skip.insert(b);
+                skip.insert(c);
+            }
+        }
+    }
+    for (si, step) in plan.steps.iter().enumerate() {
+        if let Some(k) = fused.remove(&si) {
+            kernels.push(k);
+            continue;
+        }
+        if skip.contains(&si) {
+            kernels.push(GpuKernel {
+                src: String::new(),
+                args: Vec::new(),
+                outs: Vec::new(),
+                grid: [0, 0, 0],
+                block: 0,
+                smem: 0,
+            });
+            continue;
+        }
         if let Step::Kernel(k) = step {
             kernels.push(match k {
                 Kernel::Loop(l) => codegen::loop_kernel(l, opts.tpr),
@@ -215,6 +257,10 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
     source.push_str(codegen::GATHER);
     let mut names = Vec::new();
     for k in &kernels {
+        if k.src.is_empty() {
+            names.push(String::new());
+            continue;
+        }
         let name = by_src
             .entry(k.src.clone())
             .or_insert_with(|| {
@@ -321,7 +367,11 @@ impl GpuExecutable {
                 }
             }
         }
-        let kargs: Vec<&[Arg]> = gn.kernels.iter().map(|k| k.args.as_slice()).collect();
+        let kargs: Vec<(&[Arg], Vec<usize>)> = gn
+            .kernels
+            .iter()
+            .map(|k| (k.args.as_slice(), k.outs.clone()))
+            .collect();
         let (offsets, total, naive) = arena_layout(&plan, &kargs);
         let arena = dev.alloc(total.max(16))?;
         let g = &plan.g;
@@ -376,6 +426,7 @@ impl GpuExecutable {
                                     row as DevPtr,
                                 ],
                                 name: "kgather".into(),
+                                fused: false,
                             },
                             dim: t.shape[0] as i64,
                         });
@@ -385,6 +436,10 @@ impl GpuExecutable {
                 }
                 Step::Kernel(k) => {
                     let (gk, name) = kernel_steps.next().unwrap();
+                    if gk.src.is_empty() {
+                        steps.push(GStep::Nop);
+                        continue;
+                    }
                     let mut args = Vec::new();
                     for a in &gk.args {
                         args.push(match a {
@@ -472,6 +527,9 @@ impl GpuExecutable {
                         smem: gk.smem,
                         args,
                         name: name.clone(),
+                        fused: matches!(k, Kernel::Matmul(_))
+                            && gk.grid[2] == 1
+                            && gk.src.contains("*Ss ="),
                     }));
                 }
             }
@@ -479,7 +537,7 @@ impl GpuExecutable {
         dev.sync()?;
         let stats = GpuStats {
             device: devname,
-            kernels: gn.kernels.len(),
+            kernels: gn.kernels.iter().filter(|k| !k.src.is_empty()).count(),
             unique_kernels: gn.unique.len(),
             host_steps: host,
             arena_floats: total,
@@ -572,7 +630,7 @@ impl GpuExecutable {
             }
             let host = match &self.steps[si] {
                 GStep::Host(p) => Some(*p),
-                GStep::Kernel(_) | GStep::Gather { .. } => None,
+                GStep::Kernel(_) | GStep::Gather { .. } | GStep::Nop => None,
             };
             match host {
                 Some(p) => {
@@ -610,7 +668,9 @@ impl GpuExecutable {
                 }
                 None => {
                     let mut end = si;
-                    while end < self.steps.len() && matches!(self.steps[end], GStep::Kernel(_)) {
+                    while end < self.steps.len()
+                        && matches!(self.steps[end], GStep::Kernel(_) | GStep::Nop)
+                    {
                         end += 1;
                     }
                     self.run_kernels(si, end)?;
@@ -626,7 +686,7 @@ impl GpuExecutable {
             let mut prof = prof.clone();
             for (step, t) in self.steps[a..b].iter().zip(&mut prof[a..b]) {
                 let GStep::Kernel(l) = step else {
-                    unreachable!()
+                    continue;
                 };
                 let secs = match &self.dev {
                     Dev::Cuda(c) => c.time(&mut || self.launch(l))? as f64 * 1e-3,
@@ -706,6 +766,10 @@ impl GpuExecutable {
         for ((step, t), gs) in self.plan.steps.iter().zip(p).zip(&self.steps) {
             let d = match (step, gs) {
                 (Step::Host(n), _) => format!("host {}", self.plan.g.nodes[*n].op),
+                (_, GStep::Nop) => continue,
+                (Step::Kernel(Kernel::Matmul(_)), GStep::Kernel(l)) if l.fused => {
+                    format!("attention (fused) {}", l.name)
+                }
                 (Step::Kernel(Kernel::Matmul(mk)), GStep::Kernel(l)) => {
                     format!("matmul {} {}", matmul_signature(mk), l.name)
                 }

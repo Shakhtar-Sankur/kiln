@@ -194,3 +194,33 @@ fn gpu_kernels_compile_for_t4_and_a100() {
         }
     }
 }
+
+#[test]
+fn fused_attention_applies_and_matches_pytorch() {
+    // Both two-layer transformers fuse each layer's scores, softmax and
+    // output matmul; the MLP has nothing to fuse.
+    for (m, want) in [("bert_tiny", 2), ("llama_tiny", 2), ("mlp_tiny", 0)] {
+        let (g, _, _) = load(m);
+        let plan = fuse::plan(g).unwrap();
+        assert_eq!(kiln::gpu::attention::find(&plan).len(), want, "{m}");
+    }
+    for dev in devices() {
+        for m in MODELS {
+            for attention in [true, false] {
+                run(m, FuseOpts::default(), dev, |_, opts| {
+                    opts.attention = attention
+                });
+            }
+            // Fusion off leaves no softmax row kernel to absorb.
+            run(
+                m,
+                FuseOpts {
+                    rows: false,
+                    ..FuseOpts::default()
+                },
+                dev,
+                |_, _| {},
+            );
+        }
+    }
+}

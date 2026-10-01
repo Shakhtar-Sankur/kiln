@@ -98,9 +98,12 @@ pub fn plan_memory(bufs: &[(usize, usize, usize, usize)]) -> (HashMap<usize, usi
 }
 
 /// The arena: lifetimes (in steps) of every materialized value, given each
-/// kernel step's arguments in order, packed by `plan_memory`. Returns the
+/// kernel step's arguments and the values it writes, in order, packed by `plan_memory`. Returns the
 /// offsets, the arena size and the sum of all buffer sizes (in floats).
-pub fn arena_layout(plan: &Plan, kernel_args: &[&[Arg]]) -> (HashMap<usize, usize>, usize, usize) {
+pub fn arena_layout(
+    plan: &Plan,
+    kernels: &[(&[Arg], Vec<usize>)],
+) -> (HashMap<usize, usize>, usize, usize) {
     let g = &plan.g;
     let nsteps = plan.steps.len();
     let mut start: HashMap<usize, usize> = HashMap::new();
@@ -121,7 +124,7 @@ pub fn arena_layout(plan: &Plan, kernel_args: &[&[Arg]]) -> (HashMap<usize, usiz
             touch(v, 0, true, &mut start, &mut end);
         }
     }
-    let mut args_iter = kernel_args.iter();
+    let mut args_iter = kernels.iter();
     for (si, step) in plan.steps.iter().enumerate() {
         match step {
             Step::Host(p) => {
@@ -137,22 +140,8 @@ pub fn arena_layout(plan: &Plan, kernel_args: &[&[Arg]]) -> (HashMap<usize, usiz
                     }
                 }
             }
-            Step::Kernel(k) => {
-                let args = args_iter.next().unwrap();
-                let outs: Vec<usize> = match k {
-                    Kernel::Loop(l) => l
-                        .stages
-                        .iter()
-                        .filter_map(|s| {
-                            if let crate::fuse::Stage::Store { out, .. } = s {
-                                Some(*out)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect(),
-                    Kernel::Matmul(mk) => vec![mk.out],
-                };
+            Step::Kernel(_) => {
+                let (args, outs) = args_iter.next().unwrap();
                 for a in args.iter() {
                     if let Arg::Value(v) = a
                         && plan.materialized[*v]
@@ -230,6 +219,21 @@ pub fn f32_to_f16(f: f32) -> u16 {
         h += 1;
     }
     sign | h as u16
+}
+
+/// The values a kernel writes.
+pub fn kernel_outputs(k: &Kernel) -> Vec<usize> {
+    match k {
+        Kernel::Loop(l) => l
+            .stages
+            .iter()
+            .filter_map(|s| match s {
+                crate::fuse::Stage::Store { out, .. } => Some(*out),
+                _ => None,
+            })
+            .collect(),
+        Kernel::Matmul(mk) => vec![mk.out],
+    }
 }
 
 /// Packs a constant matmul operand into panels of width `nr`: panel p
@@ -315,7 +319,14 @@ impl Executable {
             }
         }
         let lib = jit::compile(&c)?;
-        let kargs: Vec<&[Arg]> = srcs.iter().map(|(s, _)| s.args.as_slice()).collect();
+        let kargs: Vec<(&[Arg], Vec<usize>)> = srcs
+            .iter()
+            .zip(plan.steps.iter().filter_map(|s| match s {
+                Step::Kernel(k) => Some(k),
+                Step::Host(_) => None,
+            }))
+            .map(|((s, _), k)| (s.args.as_slice(), kernel_outputs(k)))
+            .collect();
         let (offsets, total, naive) = arena_layout(&plan, &kargs);
         let mut arena = vec![0f32; total.max(16)];
         let base = arena.as_mut_ptr();

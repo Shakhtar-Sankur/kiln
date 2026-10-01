@@ -20,7 +20,7 @@ for m in mlp bert llama; do
   $K run models/$m.onnx models/$m.ref --device cuda --half --tune --iters 1 > /dev/null
 done
 iters() { case $1 in mlp) echo 200 ;; *) echo 50 ;; esac; }
-CONFIGS=${CONFIGS:-"kiln half no-graphs no-tune no-fusion baselines"}
+CONFIGS=${CONFIGS:-"kiln half no-attention no-graphs no-tune no-fusion baselines"}
 run() {
   m=$1 c=$2 n=$(iters $1)
   case $c in

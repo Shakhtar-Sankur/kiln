@@ -44,6 +44,8 @@ extern "C" void kgather_emu(float **A, unsigned gx, unsigned gy, unsigned gz, un
 pub struct GpuKernel {
     pub src: String,
     pub args: Vec<Arg>,
+    /// The values the kernel writes.
+    pub outs: Vec<usize>,
     pub grid: [u32; 3],
     pub block: u32,
     pub smem: u32,
@@ -183,7 +185,7 @@ pub fn default_mm(mk: &MatmulK, sms: usize, tc: bool) -> MmParams {
     last.unwrap()
 }
 
-fn var(v: Var) -> String {
+pub(crate) fn var(v: Var) -> String {
     format!("v{v}")
 }
 
@@ -202,8 +204,8 @@ fn flt(c: f32) -> String {
 }
 
 /// Scalar CUDA expressions.
-struct Gx<'a> {
-    args: &'a HashMap<usize, usize>,
+pub(crate) struct Gx<'a> {
+    pub args: &'a HashMap<usize, usize>,
     /// Variable renames (matmul loop variables).
     names: HashMap<Var, String>,
     acc: Option<String>,
@@ -211,12 +213,28 @@ struct Gx<'a> {
     temps: bool,
 }
 
+impl<'a> Gx<'a> {
+    pub(crate) fn new(
+        args: &'a HashMap<usize, usize>,
+        names: HashMap<Var, String>,
+        acc: Option<String>,
+        temps: bool,
+    ) -> Gx<'a> {
+        Gx {
+            args,
+            names,
+            acc,
+            temps,
+        }
+    }
+}
+
 impl Gx<'_> {
     fn name(&self, v: Var) -> String {
         self.names.get(&v).cloned().unwrap_or_else(|| var(v))
     }
 
-    fn lin(&self, l: &Lin) -> String {
+    pub(crate) fn lin(&self, l: &Lin) -> String {
         l.c(&|x| self.name(x))
     }
 
@@ -227,7 +245,7 @@ impl Gx<'_> {
         }
     }
 
-    fn e(&self, e: &E) -> String {
+    pub(crate) fn e(&self, e: &E) -> String {
         match e {
             E::Load(b, l) => format!("{}[{}]", self.buf(b), self.lin(l)),
             E::Const(c) => flt(*c),
@@ -276,7 +294,7 @@ impl Gx<'_> {
     }
 }
 
-fn collect_args(exprs: &[&E], outs: &[usize]) -> (Vec<Arg>, HashMap<usize, usize>) {
+pub(crate) fn collect_args(exprs: &[&E], outs: &[usize]) -> (Vec<Arg>, HashMap<usize, usize>) {
     let mut bufs = Vec::new();
     for e in exprs {
         e.loads(&mut bufs);
@@ -302,7 +320,7 @@ fn collect_args(exprs: &[&E], outs: &[usize]) -> (Vec<Arg>, HashMap<usize, usize
 
 /// The kernel signature (outputs writable, inputs read-only) and, for the
 /// emulator, an entry point `KNAME_emu` taking the arguments as an array.
-fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
+pub(crate) fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
     let params: Vec<String> = args
         .iter()
         .enumerate()
@@ -319,7 +337,7 @@ fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
     format!("KGLOBAL({threads}) KNAME({})", params.join(", "))
 }
 
-fn emu_entry(args: &[Arg]) -> String {
+pub(crate) fn emu_entry(args: &[Arg]) -> String {
     let call: Vec<String> = args
         .iter()
         .enumerate()
@@ -338,7 +356,7 @@ fn emu_entry(args: &[Arg]) -> String {
 }
 
 /// Decodes `t` into the given variables (row-major).
-fn decode(dims: &[(Var, usize)], t: &str, indent: &str) -> String {
+pub(crate) fn decode(dims: &[(Var, usize)], t: &str, indent: &str) -> String {
     let mut s = String::new();
     let mut stride = 1usize;
     for &(v, d) in dims.iter().rev() {
@@ -398,103 +416,14 @@ pub fn default_tpr(width: usize) -> usize {
     width.next_power_of_two().clamp(1, 256)
 }
 
-pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
-    let (exprs, outs) = stage_exprs(k);
-    let (args, map) = collect_args(&exprs, &outs);
-    let nout = outs.iter().collect::<std::collections::HashSet<_>>().len();
-    let rows: usize = k.outer.iter().map(|d| d.1).product();
+/// The stages of a row kernel for one row per group of `tpr` threads, with
+/// `lane`, `live`, the row's variables, `rb{id}` row buffers and (for
+/// groups wider than a warp) `kred` already defined.
+pub(crate) fn stage_code(k: &LoopK, gx: &Gx, map: &HashMap<usize, usize>, tpr: usize) -> String {
+    let mut s = String::new();
     let (jv, width) = k.j;
     let j = var(jv);
-    let gx = Gx {
-        args: &map,
-        names: HashMap::new(),
-        acc: None,
-        temps: false,
-    };
-    let flat = k.stages.iter().all(|s| match s {
-        Stage::Scalar { .. } => true,
-        Stage::Store { per_row, .. } => !per_row,
-        _ => false,
-    }) && !reads_own_store(k).iter().any(|&b| b);
-    let mut s = String::new();
-    if flat {
-        let total = rows * width;
-        let threads = 256usize;
-        let _ = writeln!(s, "{} {{", signature(threads, &args, nout));
-        let _ = writeln!(s, "  const int e = blockIdx.x * {threads} + threadIdx.x;");
-        let _ = writeln!(s, "  if (e >= {total}) return;");
-        let _ = writeln!(s, "  const int t = e / {width};");
-        s.push_str(&decode(&k.outer, "t", "  "));
-        for st in &k.stages {
-            match st {
-                Stage::Scalar { id, body } => {
-                    let _ = writeln!(
-                        s,
-                        "  float s{id};\n  {{ const int {j} = 0; s{id} = {}; }}",
-                        gx.e(body)
-                    );
-                }
-                Stage::Store { out, idx, body, .. } => {
-                    let _ = writeln!(
-                        s,
-                        "  {{ const int {j} = e % {width}; b{}[{}] = {}; }}",
-                        map[out],
-                        gx.lin(idx),
-                        gx.e(body)
-                    );
-                }
-                _ => unreachable!(),
-            }
-        }
-        s.push_str("}\n");
-        s.push_str(&emu_entry(&args));
-        return GpuKernel {
-            src: s,
-            args,
-            grid: [total.div_ceil(threads) as u32, 1, 1],
-            block: threads as u32,
-            smem: 0,
-        };
-    }
-    let tpr = tpr.unwrap_or_else(|| default_tpr(width));
-    let threads = tpr.max(128);
-    let rpb = threads / tpr;
-    let rowbufs: Vec<u32> = k
-        .stages
-        .iter()
-        .filter_map(|s| match s {
-            Stage::RowBuf { id, .. } => Some(*id),
-            _ => None,
-        })
-        .collect();
-    let red_floats = if tpr > 32 { rpb * (tpr / 32) } else { 0 };
-    let smem = (rowbufs.len() * rpb * width + red_floats) * 4;
     let gsync = if tpr > 32 { "KSYNC();" } else { "KWSYNC();" };
-    let _ = writeln!(s, "{} {{", signature(threads, &args, nout));
-    s.push_str("  SMEM;\n");
-    let _ = writeln!(
-        s,
-        "  const int lane = threadIdx.x % {tpr}, grp = threadIdx.x / {tpr};"
-    );
-    let _ = writeln!(s, "  const int row = blockIdx.x * {rpb} + grp;");
-    let _ = writeln!(s, "  const bool live = row < {rows};");
-    let _ = writeln!(s, "  const int t = live ? row : 0;");
-    s.push_str(&decode(&k.outer, "t", "  "));
-    for (i, id) in rowbufs.iter().enumerate() {
-        let _ = writeln!(
-            s,
-            "  float *rb{id} = (float *)kiln_smem + {} + grp * {width};",
-            i * rpb * width
-        );
-    }
-    if red_floats > 0 {
-        let _ = writeln!(
-            s,
-            "  float *kred = (float *)kiln_smem + {} + grp * {};",
-            rowbufs.len() * rpb * width,
-            tpr / 32
-        );
-    }
     let _ = writeln!(s, "  int {j};");
     let rows_store = reads_own_store(k);
     for (si, st) in k.stages.iter().enumerate() {
@@ -571,11 +500,113 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
             }
         }
     }
+    s
+}
+
+pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
+    let (exprs, outs) = stage_exprs(k);
+    let (args, map) = collect_args(&exprs, &outs);
+    let nout = outs.iter().collect::<std::collections::HashSet<_>>().len();
+    let rows: usize = k.outer.iter().map(|d| d.1).product();
+    let (jv, width) = k.j;
+    let j = var(jv);
+    let gx = Gx {
+        args: &map,
+        names: HashMap::new(),
+        acc: None,
+        temps: false,
+    };
+    let flat = k.stages.iter().all(|s| match s {
+        Stage::Scalar { .. } => true,
+        Stage::Store { per_row, .. } => !per_row,
+        _ => false,
+    }) && !reads_own_store(k).iter().any(|&b| b);
+    let mut s = String::new();
+    if flat {
+        let total = rows * width;
+        let threads = 256usize;
+        let _ = writeln!(s, "{} {{", signature(threads, &args, nout));
+        let _ = writeln!(s, "  const int e = blockIdx.x * {threads} + threadIdx.x;");
+        let _ = writeln!(s, "  if (e >= {total}) return;");
+        let _ = writeln!(s, "  const int t = e / {width};");
+        s.push_str(&decode(&k.outer, "t", "  "));
+        for st in &k.stages {
+            match st {
+                Stage::Scalar { id, body } => {
+                    let _ = writeln!(
+                        s,
+                        "  float s{id};\n  {{ const int {j} = 0; s{id} = {}; }}",
+                        gx.e(body)
+                    );
+                }
+                Stage::Store { out, idx, body, .. } => {
+                    let _ = writeln!(
+                        s,
+                        "  {{ const int {j} = e % {width}; b{}[{}] = {}; }}",
+                        map[out],
+                        gx.lin(idx),
+                        gx.e(body)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        s.push_str("}\n");
+        s.push_str(&emu_entry(&args));
+        return GpuKernel {
+            src: s,
+            args,
+            outs,
+            grid: [total.div_ceil(threads) as u32, 1, 1],
+            block: threads as u32,
+            smem: 0,
+        };
+    }
+    let tpr = tpr.unwrap_or_else(|| default_tpr(width));
+    let threads = tpr.max(128);
+    let rpb = threads / tpr;
+    let rowbufs: Vec<u32> = k
+        .stages
+        .iter()
+        .filter_map(|s| match s {
+            Stage::RowBuf { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let red_floats = if tpr > 32 { rpb * (tpr / 32) } else { 0 };
+    let smem = (rowbufs.len() * rpb * width + red_floats) * 4;
+    let _ = writeln!(s, "{} {{", signature(threads, &args, nout));
+    s.push_str("  SMEM;\n");
+    let _ = writeln!(
+        s,
+        "  const int lane = threadIdx.x % {tpr}, grp = threadIdx.x / {tpr};"
+    );
+    let _ = writeln!(s, "  const int row = blockIdx.x * {rpb} + grp;");
+    let _ = writeln!(s, "  const bool live = row < {rows};");
+    let _ = writeln!(s, "  const int t = live ? row : 0;");
+    s.push_str(&decode(&k.outer, "t", "  "));
+    for (i, id) in rowbufs.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "  float *rb{id} = (float *)kiln_smem + {} + grp * {width};",
+            i * rpb * width
+        );
+    }
+    if red_floats > 0 {
+        let _ = writeln!(
+            s,
+            "  float *kred = (float *)kiln_smem + {} + grp * {};",
+            rowbufs.len() * rpb * width,
+            tpr / 32
+        );
+    }
+    s.push_str(&stage_code(k, &gx, &map, tpr));
     s.push_str("}\n");
     s.push_str(&emu_entry(&args));
     GpuKernel {
         src: s,
         args,
+        outs,
         grid: [rows.div_ceil(rpb) as u32, 1, 1],
         block: threads as u32,
         smem: smem as u32,
@@ -767,7 +798,7 @@ fn mm_common(mk: &MatmulK, half: bool) -> MmCommon {
     }
 }
 
-fn mm_names(mk: &MatmulK) -> HashMap<Var, String> {
+pub(crate) fn mm_names(mk: &MatmulK) -> HashMap<Var, String> {
     [
         (mk.vi, "_i".to_string()),
         (mk.vj, "_j".to_string()),
@@ -798,7 +829,7 @@ fn a_tile<'a>(mk: &MatmulK, gx: &Gx, bm: usize, bk: usize, nt: usize) -> Tile<'a
 }
 
 /// Epilogue: the fused elementwise root on accumulator `acc` at (_i, _j).
-fn epilogue(mk: &MatmulK, gx: &Gx, map: &HashMap<usize, usize>, indent: &str) -> String {
+pub(crate) fn epilogue(mk: &MatmulK, gx: &Gx, map: &HashMap<usize, usize>, indent: &str) -> String {
     let mut s = String::new();
     for (id, e) in &mk.lets {
         let _ = writeln!(s, "{indent}const float e{id} = {};", gx.e(e));
@@ -932,6 +963,7 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     GpuKernel {
         src: s,
         args,
+        outs: vec![mk.out],
         grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
         block: nt as u32,
         smem: ((bk * lda + bk * bn) * 4) as u32,
@@ -1072,6 +1104,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     GpuKernel {
         src: s,
         args,
+        outs: vec![mk.out],
         grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
         block: threads as u32,
         smem: ((bm + bn) * ldk * 2) as u32,

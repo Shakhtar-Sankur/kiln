@@ -54,7 +54,7 @@ print("Max |difference| from the PyTorch (CPU, fp32) reference:")
 for m in models:
     print(f"- {m}: " + ", ".join(f"{e} {diffs[(m, e)]:.1e}" for e in engines if (m, e) in diffs))
 print()
-abl = [e for e in ["kiln", "kiln --no-graphs", "kiln --no-tune", "kiln --no-fusion"] if any((m, e) in med for m in models)]
+abl = [e for e in ["kiln", "kiln --no-attention", "kiln --no-graphs", "kiln --no-tune", "kiln --no-fusion"] if any((m, e) in med for m in models)]
 print("| Model | " + " | ".join(a.replace("kiln ", "") if a != "kiln" else "kiln (all)" for a in abl) + " |")
 print("|---|" + "---|" * len(abl))
 for m in models:

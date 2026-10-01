@@ -14,7 +14,7 @@ USAGE:
   kiln cuda-check MODEL.onnx REF.ref [--arch 75] [--save FILE.cu]
                                      compile the CUDA kernels with NVRTC (no GPU needed)
   kiln run MODEL.onnx REF.ref [--device cpu|cuda|emu] [--threads N] [--iters N]
-                                     [--tune | --no-tune] [--profile] [--no-graphs] [--half]
+                                     [--tune | --no-tune] [--profile] [--no-graphs] [--half] [--no-attention]
                                      [--json FILE --label NAME]
                                      [--no-epilogue] [--no-rows] [--no-inline] [--no-fold] [--no-fusion]
                                      compile to native kernels, run, compare, time
@@ -309,6 +309,12 @@ fn main() {
                 println!("{}", l.trim());
             }
             let smem = gn.kernels.iter().map(|k| k.smem).max().unwrap_or(0);
+            let fused = gn
+                .kernels
+                .iter()
+                .filter(|k| k.src.contains("*Ss ="))
+                .count();
+            println!("fused attention kernels: {fused}");
             let blocks: usize = gn
                 .kernels
                 .iter()
@@ -316,7 +322,7 @@ fn main() {
                 .sum();
             println!(
                 "largest shared memory {smem} bytes; {blocks} blocks over {} launches",
-                gn.kernels.len()
+                gn.kernels.iter().filter(|k| !k.src.is_empty()).count()
             );
             println!(
                 "sm_{arch}: {} kernels compiled in {:.2} s, {} bytes of CUBIN, NVRTC {:?}, {} with spills",
@@ -369,6 +375,7 @@ fn run_gpu(
     let mut opts = GpuOptions::new(device);
     opts.graphs = !has("--no-graphs");
     opts.half = has("--half");
+    opts.attention = !has("--no-attention");
     if !has("--no-tune") {
         opts.mm = kiln::gpu::tune::cached(&plan, device, opts.half);
     }
