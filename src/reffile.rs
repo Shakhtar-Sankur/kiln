@@ -71,16 +71,20 @@ pub fn load(path: &Path) -> Result<Reference, String> {
             let t = match dtype.as_str() {
                 "f32" => {
                     let v = b[pos..pos + 4 * n]
-                        .chunks_exact(4)
-                        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c))
                         .collect();
                     pos += 4 * n;
                     Tensor::f32(shape, v)
                 }
                 _ => {
                     let v = b[pos..pos + 8 * n]
-                        .chunks_exact(8)
-                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|c| i64::from_le_bytes(*c))
                         .collect();
                     pos += 8 * n;
                     Tensor::i64(shape, v)

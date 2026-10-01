@@ -13,7 +13,7 @@ pub fn load(path: &Path) -> Result<Graph, String> {
 
 pub fn parse_model(bytes: &[u8]) -> Result<Graph, String> {
     let mut r = Reader::new(bytes);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         if num == 7 {
             return parse_graph(f.bytes());
         }
@@ -34,7 +34,7 @@ fn parse_graph(b: &[u8]) -> Result<Graph, String> {
     let mut outputs = Vec::new();
     let mut infos = Vec::new();
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         match num {
             1 => nodes.push(parse_node(f.bytes())?),
             5 => inits.push(parse_tensor(f.bytes())?),
@@ -116,7 +116,7 @@ fn parse_node(b: &[u8]) -> Result<RawNode, String> {
     };
     let mut domain = String::new();
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         match num {
             1 => n.inputs.push(f.string()),
             2 => n.outputs.push(f.string()),
@@ -147,7 +147,7 @@ fn parse_attr(b: &[u8]) -> Result<(String, Option<Attr>), String> {
     let (mut floats, mut ints) = (Vec::new(), Vec::new());
     let mut ty = 0;
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         match num {
             1 => name = f.string(),
             2 => fl = Some(f.float()),
@@ -181,7 +181,7 @@ fn parse_tensor(b: &[u8]) -> Result<(String, Tensor), String> {
     let (mut floats, mut ints, mut int32s) = (Vec::new(), Vec::new(), Vec::new());
     let mut external = false;
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         match num {
             1 => f.ints(&mut dims)?,
             2 => ty = f.int(),
@@ -203,8 +203,10 @@ fn parse_tensor(b: &[u8]) -> Result<(String, Tensor), String> {
         DType::F32 => {
             let v = match raw {
                 Some(b) => b
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect(),
                 None => floats,
             };
@@ -213,12 +215,16 @@ fn parse_tensor(b: &[u8]) -> Result<(String, Tensor), String> {
         DType::I64 => {
             let v = match (raw, ty) {
                 (Some(b), 7) => b
-                    .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from_le_bytes(*c))
                     .collect(),
                 (Some(b), _) => b
-                    .chunks_exact(4)
-                    .map(|c| i64::from(i32::from_le_bytes(c.try_into().unwrap())))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i64::from(i32::from_le_bytes(*c)))
                     .collect(),
                 (None, 7) => ints,
                 (None, _) => int32s,
@@ -250,18 +256,18 @@ fn parse_value_info(b: &[u8]) -> Result<ValueInfo, String> {
         shape: None,
     };
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         match num {
             1 => vi.name = f.string(),
             2 => {
                 // TypeProto.tensor_type
                 let mut tr = Reader::new(f.bytes());
-                while let Some((tn, tf)) = tr.next()? {
+                while let Some((tn, tf)) = tr.field()? {
                     if tn != 1 {
                         continue;
                     }
                     let mut rr = Reader::new(tf.bytes());
-                    while let Some((n2, f2)) = rr.next()? {
+                    while let Some((n2, f2)) = rr.field()? {
                         match n2 {
                             1 => vi.dtype = DType::from_onnx(f2.int()).ok(),
                             2 => vi.shape = parse_shape(f2.bytes())?,
@@ -281,13 +287,13 @@ fn parse_shape(b: &[u8]) -> Result<Option<Vec<usize>>, String> {
     let mut dims = Vec::new();
     let mut known = true;
     let mut r = Reader::new(b);
-    while let Some((num, f)) = r.next()? {
+    while let Some((num, f)) = r.field()? {
         if num != 1 {
             continue;
         }
         let mut d = None;
         let mut dr = Reader::new(f.bytes());
-        while let Some((n2, f2)) = dr.next()? {
+        while let Some((n2, f2)) = dr.field()? {
             if n2 == 1 {
                 d = Some(f2.int() as usize);
             }

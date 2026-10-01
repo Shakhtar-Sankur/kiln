@@ -45,7 +45,7 @@ impl<'a> Reader<'a> {
     }
 
     /// The next field, or None at the end of the message.
-    pub fn next(&mut self) -> Result<Option<(u32, Field<'a>)>, String> {
+    pub fn field(&mut self) -> Result<Option<(u32, Field<'a>)>, String> {
         if self.pos >= self.buf.len() {
             return Ok(None);
         }
@@ -110,10 +110,9 @@ impl<'a> Field<'a> {
     /// A repeated float field, packed or not.
     pub fn floats(&self, out: &mut Vec<f32>) {
         match self {
-            Field::Bytes(b) => out.extend(
-                b.chunks_exact(4)
-                    .map(|c| f32::from_le_bytes(c.try_into().unwrap())),
-            ),
+            Field::Bytes(b) => {
+                out.extend(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)))
+            }
             f => out.push(f.float()),
         }
     }

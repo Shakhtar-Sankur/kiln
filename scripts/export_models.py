@@ -6,6 +6,7 @@ Usage: python scripts/export_models.py OUT_DIR [mlp|bert|llama ...]
   mlp    a 4-layer MLP block (LayerNorm, Linear, GELU, residual), batch 64
   bert   BAAI/bge-small-en-v1.5 (needs models/bge-small), batch 8 x 128 tokens
   llama  SmolLM2-135M (needs models/smollm2-135m), 1 x 128 tokens -> logits
+  tiny   small random-weight versions of all three (tests/fixtures)
 
 Each model writes NAME.onnx and NAME.ref (see write_ref) to OUT_DIR.
 """
@@ -165,6 +166,53 @@ def llama(out, path="models/smollm2-135m", seq=128):
     assert err < 1e-3, err
     export(m, (ids,), ["input_ids"], ["logits"], os.path.join(out, "llama.onnx"))
     write_ref(os.path.join(out, "llama.ref"), [("input_ids", ids)], [("logits", got)])
+
+
+def tiny(out):
+    """Small random-weight versions of the three models, for tests and CI."""
+    from transformers import BertConfig, BertModel, LlamaConfig, LlamaForCausalLM
+
+    m = Mlp(d=48, h=96, n=2)
+    x = torch.randn(10, 48)
+    export(m, (x,), ["x"], ["y"], os.path.join(out, "mlp_tiny.onnx"))
+    with torch.no_grad():
+        write_ref(os.path.join(out, "mlp_tiny.ref"), [("x", x)], [("y", m(x))])
+
+    cfg = BertConfig(vocab_size=200, hidden_size=32, num_hidden_layers=2, num_attention_heads=4,
+                     intermediate_size=64, max_position_embeddings=64, attn_implementation="eager")
+    bm = BertModel(cfg, add_pooling_layer=False).eval()
+
+    class TinyBert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.m = bm
+
+        def forward(self, ids, mask):
+            h = self.m(input_ids=ids, attention_mask=mask).last_hidden_state
+            cls = h[:, 0]
+            return cls / cls.norm(dim=-1, keepdim=True)
+
+    tb = TinyBert().eval()
+    ids = torch.randint(0, 200, (3, 17))
+    mask = torch.ones(3, 17, dtype=torch.int64)
+    mask[1, 12:] = 0
+    export(tb, (ids, mask), ["input_ids", "attention_mask"], ["embedding"], os.path.join(out, "bert_tiny.onnx"))
+    with torch.no_grad():
+        write_ref(os.path.join(out, "bert_tiny.ref"), [("input_ids", ids), ("attention_mask", mask)],
+                  [("embedding", tb(ids, mask))])
+
+    lc = LlamaConfig(vocab_size=300, hidden_size=64, intermediate_size=96, num_hidden_layers=2,
+                     num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+                     rope_theta=10000.0, tie_word_embeddings=True, attn_implementation="eager")
+    hf = LlamaForCausalLM(lc).eval()
+    lm = Llama(hf, 19).eval()
+    ids = torch.randint(0, 300, (1, 19))
+    with torch.no_grad():
+        want = hf(input_ids=ids, use_cache=False).logits
+        got = lm(ids)
+    assert (got - want).abs().max().item() < 1e-4
+    export(lm, (ids,), ["input_ids"], ["logits"], os.path.join(out, "llama_tiny.onnx"))
+    write_ref(os.path.join(out, "llama_tiny.ref"), [("input_ids", ids)], [("logits", got)])
 
 
 if __name__ == "__main__":
