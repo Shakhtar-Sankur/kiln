@@ -59,6 +59,11 @@ fn loads_of<'a>(e: &'a E, v: usize, out: &mut Vec<&'a Lin>) {
             loads_of(a, v, out);
             loads_of(b, v, out);
         }
+        E::If(c, a, b) => {
+            loads_of(c, v, out);
+            loads_of(a, v, out);
+            loads_of(b, v, out);
+        }
         _ => {}
     }
 }
@@ -70,6 +75,11 @@ fn to_row(e: &E, v: usize, id: u32, j: Var) -> E {
         E::Un(op, a) => E::Un(*op, Box::new(to_row(a, v, id, j))),
         E::Bin(op, a, b) => E::Bin(
             *op,
+            Box::new(to_row(a, v, id, j)),
+            Box::new(to_row(b, v, id, j)),
+        ),
+        E::If(c, a, b) => E::If(
+            Box::new(to_row(c, v, id, j)),
             Box::new(to_row(a, v, id, j)),
             Box::new(to_row(b, v, id, j)),
         ),

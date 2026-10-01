@@ -121,6 +121,18 @@ impl Tensor {
         }
     }
 
+    /// Values as f32, from any type: booleans as 0 and 1, integers as the
+    /// nearest float (as ONNX's Cast to float). Borrowed when already f32.
+    pub fn to_f32(&self) -> std::borrow::Cow<'_, [f32]> {
+        match &self.data {
+            Data::F32(v) => std::borrow::Cow::Borrowed(v),
+            Data::I64(v) => std::borrow::Cow::Owned(v.iter().map(|&x| x as f32).collect()),
+            Data::Bool(v) => {
+                std::borrow::Cow::Owned(v.iter().map(|&x| f32::from(u8::from(x))).collect())
+            }
+        }
+    }
+
     /// Values as i64 (for shapes, axes and indices), from any type.
     pub fn to_i64(&self) -> Vec<i64> {
         match &self.data {

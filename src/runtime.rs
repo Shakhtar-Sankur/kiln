@@ -44,6 +44,8 @@ pub struct Executable {
     arena: Vec<f32>,
     offsets: HashMap<usize, usize>,
     _packed: Vec<Vec<f32>>,
+    /// Non-f32 constants kernels read, as carried f32.
+    _converted: Vec<Vec<f32>>,
     _lib: Library,
     pool: Pool,
     pub stats: Stats,
@@ -332,6 +334,7 @@ impl Executable {
         let base = arena.as_mut_ptr();
         // Packed weights, shared between kernels using the same layout.
         let mut packed: Vec<Vec<f32>> = Vec::new();
+        let mut converted: Vec<Vec<f32>> = Vec::new();
         let mut packed_ids: HashMap<(usize, crate::ir::Lin, usize), usize> = HashMap::new();
         let mut steps = Vec::new();
         let mut src_iter = srcs.iter();
@@ -349,7 +352,13 @@ impl Executable {
                         let ptr = match a {
                             Arg::Value(v) => {
                                 if let Some(t) = g.konst(*v) {
-                                    t.as_f32().as_ptr() as *mut f32
+                                    if t.dtype() == DType::F32 {
+                                        t.as_f32().as_ptr() as *mut f32
+                                    } else {
+                                        // Booleans and integers, carried as f32.
+                                        converted.push(t.to_f32().into_owned());
+                                        converted.last().unwrap().as_ptr() as *mut f32
+                                    }
                                 } else {
                                     let off = *offsets.get(v).ok_or_else(|| {
                                         format!("value {} has no buffer", g.values[*v].name)
@@ -416,6 +425,7 @@ impl Executable {
             arena,
             offsets,
             _packed: packed,
+            _converted: converted,
             _lib: lib,
             pool: Pool::new(opts.threads),
             stats,
@@ -433,10 +443,13 @@ impl Executable {
         let g = &self.plan.g;
         let mut env: HashMap<usize, Tensor> = HashMap::new();
         for (&v, t) in feeds {
-            if t.dtype() == DType::F32 && self.plan.materialized[v] {
+            // Kernels read booleans and integers as carried f32; the host
+            // keeps their real type.
+            if self.plan.materialized[v] {
                 let off = self.offsets[&v];
-                self.arena[off..off + t.len()].copy_from_slice(t.as_f32());
-            } else {
+                self.arena[off..off + t.len()].copy_from_slice(&t.to_f32());
+            }
+            if t.dtype() != DType::F32 || !self.plan.materialized[v] {
                 env.insert(v, t.clone());
             }
         }
@@ -482,10 +495,11 @@ impl Executable {
                     let outs = interp::eval(n, &refs)
                         .map_err(|e| format!("step {si} host {}: {e}", n.op))?;
                     for (&o, t) in n.outputs.iter().zip(outs) {
-                        if t.dtype() == DType::F32 && self.plan.materialized[o] {
+                        if self.plan.materialized[o] {
                             let off = self.offsets[&o];
-                            self.arena[off..off + t.len()].copy_from_slice(t.as_f32());
-                        } else {
+                            self.arena[off..off + t.len()].copy_from_slice(&t.to_f32());
+                        }
+                        if t.dtype() != DType::F32 || !self.plan.materialized[o] {
                             env.insert(o, t);
                         }
                     }

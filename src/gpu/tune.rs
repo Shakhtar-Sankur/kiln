@@ -137,7 +137,7 @@ pub fn tune(
                 Arg::Value(v) => match g.konst(*v) {
                     Some(t) => {
                         let p = c.alloc(t.len() * 4)?;
-                        c.upload(p, t.as_f32())?;
+                        c.upload(p, &t.to_f32())?;
                         p
                     }
                     None => {
@@ -382,7 +382,7 @@ pub fn tune_attention(
                             let p = match g.konst(*v) {
                                 Some(t) => {
                                     let p = c.alloc(t.len() * 4)?;
-                                    c.upload(p, t.as_f32())?;
+                                    c.upload(p, &t.to_f32())?;
                                     p
                                 }
                                 None => {

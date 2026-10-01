@@ -186,7 +186,7 @@ fn harness(plan: &Plan, args: &[Arg]) -> Harness {
             .zip(&activations)
             .map(|(a, act)| match (a, act) {
                 (_, Some(v)) => v.clone(),
-                (Arg::Value(v), None) => g.konst(*v).unwrap().as_f32().to_vec(),
+                (Arg::Value(v), None) => g.konst(*v).unwrap().to_f32().into_owned(),
                 (Arg::Packed { k, n, nr, .. }, None) => {
                     (0..n.div_ceil(*nr) * k * nr).map(|_| rnd()).collect()
                 }

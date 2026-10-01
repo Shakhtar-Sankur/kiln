@@ -187,6 +187,7 @@ impl Cx<'_> {
                     Un::Relu => format!("smax({a}, 0.0f)"),
                     Un::Sigmoid => format!("ssig({a})"),
                     Un::Recip => format!("(1.0f / {a})"),
+                    Un::Nz => format!("({a} != 0.0f ? 1.0f : 0.0f)"),
                 }
             }
             E::Bin(op, a, b) => {
@@ -204,6 +205,12 @@ impl Cx<'_> {
                 "(({}) < {} ? {} : {})",
                 self.lin(&c.lhs, lane),
                 c.bound,
+                self.scalar(a, lane),
+                self.scalar(b, lane)
+            ),
+            E::If(c, a, b) => format!(
+                "({} != 0.0f ? {} : {})",
+                self.scalar(c, lane),
                 self.scalar(a, lane),
                 self.scalar(b, lane)
             ),
@@ -250,6 +257,9 @@ impl Cx<'_> {
                 let f = match op {
                     Un::Neg => return (format!("(-{s})"), true),
                     Un::Recip => return (format!("(vb(1.0f) / {s})"), true),
+                    Un::Nz => {
+                        return (format!("vsel({s} != vb(0.0f), vb(1.0f), vb(0.0f))"), true);
+                    }
                     Un::Sqrt => "vsqrt",
                     Un::Erf => "verf",
                     Un::Exp => "vexp",
@@ -278,6 +288,24 @@ impl Cx<'_> {
                         Bin::Pow => format!("vpow({pa}, {pb})"),
                         Bin::Max => format!("vmax({pa}, {pb})"),
                     },
+                    true,
+                )
+            }
+            E::If(c, a, b) => {
+                let (sc, vc) = self.vec_inner(c);
+                let (sa, va) = self.vec_inner(a);
+                let (sb, vb) = self.vec_inner(b);
+                if !vc && !va && !vb {
+                    return (self.scalar(e, false), false);
+                }
+                let w = |s: String, v: bool| if v { s } else { format!("vb({s})") };
+                (
+                    format!(
+                        "vsel({} != vb(0.0f), {}, {})",
+                        w(sc, vc),
+                        w(sa, va),
+                        w(sb, vb)
+                    ),
                     true,
                 )
             }

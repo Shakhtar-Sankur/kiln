@@ -457,7 +457,7 @@ impl GpuExecutable {
                                     match consts.get(v) {
                                         Some(&p) => p,
                                         None => {
-                                            let p = dev.upload(t.as_f32())?;
+                                            let p = dev.upload(&t.to_f32())?;
                                             consts.insert(*v, p);
                                             p
                                         }
@@ -601,10 +601,16 @@ impl GpuExecutable {
     /// Runs the model; outputs stay on the device until `outputs`.
     fn execute(&mut self, feeds: &interp::Feeds) -> Result<HashMap<usize, Tensor>, String> {
         let mut env: HashMap<usize, Tensor> = HashMap::new();
+        let mut staged: Vec<std::borrow::Cow<'_, [f32]>> = Vec::new();
         for (&v, t) in feeds {
-            if t.dtype() == DType::F32 && self.plan.materialized[v] {
-                self.dev.h2d(self.value_ptr(v), t.as_f32())?;
-            } else {
+            // Kernels read booleans and integers as carried f32; the host
+            // keeps their real type.
+            if self.plan.materialized[v] {
+                let data = t.to_f32();
+                self.dev.h2d(self.value_ptr(v), &data)?;
+                staged.push(data);
+            }
+            if t.dtype() != DType::F32 || !self.plan.materialized[v] {
                 env.insert(v, t.clone());
             }
         }
@@ -666,10 +672,11 @@ impl GpuExecutable {
                     let outs = interp::eval(n, &refs)
                         .map_err(|e| format!("step {si} host {}: {e}", n.op))?;
                     for (&o, t) in n.outputs.iter().zip(outs) {
-                        if t.dtype() == DType::F32 && self.plan.materialized[o] {
-                            self.dev.h2d(self.value_ptr(o), t.as_f32())?;
+                        if self.plan.materialized[o] {
+                            self.dev.h2d(self.value_ptr(o), &t.to_f32())?;
                             self.dev.sync()?;
-                        } else {
+                        }
+                        if t.dtype() != DType::F32 || !self.plan.materialized[o] {
                             env.insert(o, t);
                         }
                     }

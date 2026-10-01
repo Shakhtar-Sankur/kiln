@@ -5,7 +5,7 @@
 use crate::fuse::{ACC, BOp, Kernel, Plan, Red, Stage, Step};
 use crate::interp::{self, Feeds};
 use crate::ir::{Bin, Buf, E, Lin, Un, Var};
-use crate::tensor::{DType, Tensor};
+use crate::tensor::Tensor;
 use std::collections::HashMap;
 
 struct Env<'a> {
@@ -28,6 +28,7 @@ fn un(op: Un, x: f32) -> f32 {
         Un::Relu => x.max(0.0),
         Un::Sigmoid => 1.0 / (1.0 + (-x).exp()),
         Un::Recip => 1.0 / x,
+        Un::Nz => f32::from(u8::from(x != 0.0)),
     }
 }
 
@@ -65,6 +66,13 @@ impl Env<'_> {
                     self.e(b)
                 }
             }
+            E::If(c, a, b) => {
+                if self.e(c) != 0.0 {
+                    self.e(a)
+                } else {
+                    self.e(b)
+                }
+            }
         }
     }
 }
@@ -93,16 +101,12 @@ pub fn run(plan: &Plan, feeds: &Feeds) -> Result<HashMap<usize, Tensor>, String>
     let mut tensors: HashMap<usize, Tensor> = feeds.clone();
     for (i, v) in g.values.iter().enumerate() {
         if let Some(t) = &v.konst {
-            if t.dtype() == DType::F32 {
-                vals.insert(i, t.as_f32().to_vec());
-            }
+            vals.insert(i, t.to_f32().into_owned());
             tensors.insert(i, t.clone());
         }
     }
     for (&v, t) in feeds {
-        if t.dtype() == DType::F32 {
-            vals.insert(v, t.as_f32().to_vec());
-        }
+        vals.insert(v, t.to_f32().into_owned());
     }
     for step in &plan.steps {
         match step {
@@ -122,9 +126,7 @@ pub fn run(plan: &Plan, feeds: &Feeds) -> Result<HashMap<usize, Tensor>, String>
                 let refs: Vec<Option<&Tensor>> = ins.iter().map(Option::as_ref).collect();
                 let outs = interp::eval(n, &refs)?;
                 for (&o, t) in n.outputs.iter().zip(outs) {
-                    if t.dtype() == DType::F32 {
-                        vals.insert(o, t.as_f32().to_vec());
-                    }
+                    vals.insert(o, t.to_f32().into_owned());
                     tensors.insert(o, t);
                 }
             }

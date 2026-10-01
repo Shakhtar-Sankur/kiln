@@ -270,6 +270,7 @@ impl Gx<'_> {
                     Un::Relu => format!("krelu({a})"),
                     Un::Sigmoid => format!("ksig({a})"),
                     Un::Recip => format!("(1.0f / {a})"),
+                    Un::Nz => format!("({a} != 0.0f ? 1.0f : 0.0f)"),
                 }
             }
             E::Bin(op, a, b) => {
@@ -290,6 +291,7 @@ impl Gx<'_> {
                 self.e(a),
                 self.e(b)
             ),
+            E::If(c, a, b) => format!("({} != 0.0f ? {} : {})", self.e(c), self.e(a), self.e(b)),
         }
     }
 }

@@ -359,6 +359,9 @@ pub enum Un {
     Relu,
     Sigmoid,
     Recip,
+    /// 1 where the operand is nonzero, else 0 (a cast to bool, with
+    /// booleans and integers carried as f32).
+    Nz,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -395,6 +398,8 @@ pub enum E {
     Un(Un, Box<E>),
     Bin(Bin, Box<E>, Box<E>),
     Sel(Cond, Box<E>, Box<E>),
+    /// `a` where `c` is nonzero, else `b` (ONNX Where on carried booleans).
+    If(Box<E>, Box<E>, Box<E>),
 }
 
 impl E {
@@ -405,6 +410,7 @@ impl E {
             E::Un(_, a) => 1 + a.ops(),
             E::Bin(_, a, b) => 1 + a.ops() + b.ops(),
             E::Sel(_, a, b) => 1 + a.ops() + b.ops(),
+            E::If(c, a, b) => 1 + c.ops() + a.ops() + b.ops(),
         }
     }
 
@@ -418,6 +424,11 @@ impl E {
             }
             E::Un(_, a) => a.loads(out),
             E::Bin(_, a, b) | E::Sel(_, a, b) => {
+                a.loads(out);
+                b.loads(out);
+            }
+            E::If(c, a, b) => {
+                c.loads(out);
                 a.loads(out);
                 b.loads(out);
             }

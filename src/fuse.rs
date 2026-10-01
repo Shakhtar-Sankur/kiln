@@ -169,6 +169,68 @@ pub fn classify(g: &Graph, n: &crate::graph::Node) -> Class {
     }
 }
 
+/// Booleans and integers carried as f32 (booleans as 0 and 1, integers as
+/// their nearest float, which is what ONNX's Cast to float computes): the
+/// operations that stay exact in that representation, fused like f32 ones.
+/// Integer arithmetic is not among them (it would round above 2^24).
+fn lifted_class(g: &Graph, n: &crate::graph::Node) -> Option<Class> {
+    match n.op.as_str() {
+        // To bool: x != 0 (exact for any integer); to float: the carried
+        // value itself.
+        "Cast" => matches!(n.attr_int("to", 1), 1 | 9).then_some(Class::Elem),
+        "And" | "Or" | "Not" | "Where" => Some(Class::Elem),
+        "Identity" | "Reshape" | "Transpose" | "Slice" | "Concat" | "Expand" | "Tile" => {
+            Some(Class::Move)
+        }
+        "Gather" => {
+            let u = n.input(0);
+            let r = g.shape(u).len() as i64;
+            let a = n.attr_int("axis", 0);
+            let a = if a < 0 { a + r } else { a } as usize;
+            let dim = g.shape(u)[a] as i64;
+            g.konst(n.input(1))
+                .and_then(|t| affine_index(t, dim))
+                .map(|_| Class::Move)
+        }
+        _ => None,
+    }
+}
+
+/// A constant index tensor that is an affine function of its position,
+/// `c + Σ s_d · i_d` (after wrapping negative indices by `dim`), every
+/// value in range: (c, s).
+pub fn affine_index(t: &Tensor, dim: i64) -> Option<(i64, Vec<i64>)> {
+    let v: Vec<i64> = t
+        .to_i64()
+        .iter()
+        .map(|&x| if x < 0 { x + dim } else { x })
+        .collect();
+    if v.is_empty() || v.iter().any(|&x| !(0..dim).contains(&x)) {
+        return None;
+    }
+    let shape = &t.shape;
+    let st = crate::tensor::strides(shape);
+    let c = v[0];
+    let s: Vec<i64> = (0..shape.len())
+        .map(|d| if shape[d] > 1 { v[st[d]] - c } else { 0 })
+        .collect();
+    let mut idx = vec![0usize; shape.len()];
+    for &x in &v {
+        let want = c + idx.iter().zip(&s).map(|(&i, &k)| i as i64 * k).sum::<i64>();
+        if x != want {
+            return None;
+        }
+        for d in (0..shape.len()).rev() {
+            idx[d] += 1;
+            if idx[d] < shape[d] {
+                break;
+            }
+            idx[d] = 0;
+        }
+    }
+    Some((c, s))
+}
+
 struct Ctx<'a> {
     g: &'a Graph,
     prod: &'a [Option<usize>],
@@ -224,7 +286,7 @@ impl Ctx<'_> {
         let shape = self.g.shape(v);
         if let Some(t) = self.g.konst(v) {
             if t.len() == 1 {
-                return Ok(E::Const(t.as_f32()[0]));
+                return Ok(E::Const(t.to_f32()[0]));
             }
             return Ok(E::Load(Buf::Value(v), linearize(idx, shape)));
         }
@@ -264,6 +326,26 @@ impl Ctx<'_> {
             "Relu" => un(Un::Relu),
             "Sigmoid" => un(Un::Sigmoid),
             "Reciprocal" => un(Un::Recip),
+            // Carried booleans and integers (see `lifted_class`).
+            "Cast" => {
+                if n.attr_int("to", 1) == 9 {
+                    un(Un::Nz)
+                } else {
+                    input(0)
+                }
+            }
+            "And" => bin(Bin::Mul),
+            "Or" => bin(Bin::Max),
+            "Not" => Ok(E::Bin(
+                Bin::Sub,
+                Box::new(E::Const(1.0)),
+                Box::new(input(0)?),
+            )),
+            "Where" => Ok(E::If(
+                Box::new(input(0)?),
+                Box::new(input(1)?),
+                Box::new(input(2)?),
+            )),
             "Identity" => input(0),
             "Expand" => input(0),
             "Reshape" => {
@@ -328,15 +410,19 @@ impl Ctx<'_> {
                         a as usize
                     }
                 };
-                let c = self.g.konst(n.input(1)).unwrap().to_i64()[0];
-                let c = if c < 0 {
-                    c + self.g.shape(u)[a] as i64
-                } else {
-                    c
-                };
+                let dim = self.g.shape(u)[a] as i64;
+                let t = self.g.konst(n.input(1)).ok_or("Gather indices")?;
+                let (c, st) = affine_index(t, dim).ok_or("Gather indices not affine")?;
+                let ir = t.shape.len();
+                // Output index: idx[..a], then the index tensor's position
+                // (ir dimensions), then the data's trailing dimensions.
+                let mut at = Lin::konst(c);
+                for d in 0..ir {
+                    at = at.add(&idx[a + d].scale(st[d]));
+                }
                 let mut ii: Vec<Lin> = idx[..a].to_vec();
-                ii.push(Lin::konst(c));
-                ii.extend(idx[a..].iter().cloned());
+                ii.push(at);
+                ii.extend(idx[a + ir..].iter().cloned());
                 self.build(u, &ii)
             }
             "Concat" => {
@@ -444,7 +530,50 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
 pub fn plan_with(g: Graph, opts: FuseOpts) -> Result<Plan, String> {
     let nv = g.values.len();
     let prod = g.producers();
-    let class: Vec<Class> = g.nodes.iter().map(|n| classify(&g, n)).collect();
+    let mut class: Vec<Class> = g.nodes.iter().map(|n| classify(&g, n)).collect();
+    // Lift boolean and integer operations into kernels, then hand back to
+    // the host (cascading backwards) any whose non-f32 result something on
+    // the host, a matmul, a reduction or the graph's outputs would read:
+    // those need the real type.
+    let mut lifted = vec![false; g.nodes.len()];
+    for (i, n) in g.nodes.iter().enumerate() {
+        if class[i] == Class::Host
+            && let Some(c) = lifted_class(&g, n)
+        {
+            class[i] = c;
+            lifted[i] = true;
+        }
+    }
+    {
+        let mut consumers: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        for (i, n) in g.nodes.iter().enumerate() {
+            for &u in n.inputs.iter().flatten() {
+                consumers[u].push(i);
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (i, n) in g.nodes.iter().enumerate() {
+                if !lifted[i] || class[i] == Class::Host {
+                    continue;
+                }
+                let needs_type = n.outputs.iter().any(|&o| {
+                    g.values[o].dtype != Some(DType::F32)
+                        && (g.outputs.contains(&o)
+                            || consumers[o].iter().any(|&c| {
+                                matches!(class[c], Class::Host | Class::MatMul | Class::Reduce(_))
+                            }))
+                });
+                if needs_type {
+                    class[i] = Class::Host;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
     let uses = g.use_counts();
     let is_output: Vec<bool> = {
         let mut o = vec![false; nv];
@@ -858,15 +987,51 @@ pub fn plan_with(g: Graph, opts: FuseOpts) -> Result<Plan, String> {
     // A value has an arena buffer if it is an f32 graph input or some
     // step writes it; everything else lives in registers or row-local
     // scratch, or is recomputed where it is read.
+    // Inputs and host results get a buffer when f32 or read by a kernel
+    // (booleans and integers then as carried f32).
+    let mut kernel_reads: HashSet<usize> = HashSet::new();
+    for s in &steps {
+        if let Step::Kernel(k) = s {
+            let mut bufs = Vec::new();
+            match k {
+                Kernel::Matmul(mk) => {
+                    mk.a.loads(&mut bufs);
+                    mk.epi.loads(&mut bufs);
+                    for l in &mk.lets {
+                        l.1.loads(&mut bufs);
+                    }
+                    if let BOp::Expr(e) = &mk.b {
+                        e.loads(&mut bufs);
+                    }
+                }
+                Kernel::Loop(l) => {
+                    for st in &l.stages {
+                        match st {
+                            Stage::Reduce { body, .. }
+                            | Stage::Scalar { body, .. }
+                            | Stage::RowBuf { body, .. }
+                            | Stage::Store { body, .. } => body.loads(&mut bufs),
+                        }
+                    }
+                }
+            }
+            for b in bufs {
+                if let Buf::Value(v) = b {
+                    kernel_reads.insert(v);
+                }
+            }
+        }
+    }
     let mut materialized = vec![false; nv];
     for &v in &g.inputs {
-        materialized[v] = g.values[v].dtype == Some(DType::F32);
+        materialized[v] = g.values[v].dtype == Some(DType::F32) || kernel_reads.contains(&v);
     }
     for s in &steps {
         match s {
             Step::Host(p) => {
                 for &o in &g.nodes[*p].outputs {
-                    materialized[o] = g.values[o].dtype == Some(DType::F32);
+                    materialized[o] =
+                        g.values[o].dtype == Some(DType::F32) || kernel_reads.contains(&o);
                 }
             }
             Step::Kernel(Kernel::Matmul(mk)) => materialized[mk.out] = true,
