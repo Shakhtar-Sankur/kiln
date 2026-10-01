@@ -7,7 +7,7 @@ import os
 import numpy as np
 import torch
 
-MODELS = os.environ.get("FERROLM_MODELS", "/home/user/ferrolm/models")
+MODELS = os.environ.get("KILN_MODELS") or os.environ.get("FERROLM_MODELS", "/home/user/ferrolm/models")
 
 
 def torch_model(name, feeds):

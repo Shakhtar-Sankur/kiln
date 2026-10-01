@@ -38,7 +38,7 @@ pub fn vector_width() -> usize {
     8
 }
 
-fn fnv(s: &str) -> u64 {
+pub fn fnv(s: &str) -> u64 {
     let mut h = 0xcbf29ce484222325u64;
     for b in s.bytes() {
         h ^= u64::from(b);
@@ -67,22 +67,33 @@ pub const CFLAGS: &[&str] = &[
 /// Compiles `src` (or reuses a cached build) and opens it.
 pub fn compile(src: &str) -> Result<Library, String> {
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let key = format!("{:016x}", fnv(&format!("{cc} {CFLAGS:?}\n{src}")));
+    compile_with(&cc, CFLAGS, &["-lm"], "c", src)
+}
+
+/// Compiles `src` with `cc` and `flags` into a cached shared library.
+pub fn compile_with(
+    cc: &str,
+    flags: &[&str],
+    libs: &[&str],
+    ext: &str,
+    src: &str,
+) -> Result<Library, String> {
+    let key = format!("{:016x}", fnv(&format!("{cc} {flags:?} {libs:?}\n{src}")));
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let so = dir.join(format!("k{key}.so"));
     let t = std::time::Instant::now();
     let cached = so.exists();
     if !cached {
-        let c = dir.join(format!("k{key}.c"));
+        let c = dir.join(format!("k{key}.{ext}"));
         std::fs::write(&c, src).map_err(|e| e.to_string())?;
         let tmp = dir.join(format!("k{key}.{}.tmp.so", std::process::id()));
-        let out = std::process::Command::new(&cc)
-            .args(CFLAGS)
+        let out = std::process::Command::new(cc)
+            .args(flags)
             .arg("-o")
             .arg(&tmp)
             .arg(&c)
-            .arg("-lm")
+            .args(libs)
             .output()
             .map_err(|e| format!("{cc}: {e}"))?;
         if !out.status.success() {
@@ -129,6 +140,17 @@ impl Library {
             compile_seconds: 0.0,
             cached: true,
         }
+    }
+
+    /// The address of symbol `name`.
+    pub fn symbol(&self, name: &str) -> Result<*mut c_void, String> {
+        let c = CString::new(name).unwrap();
+        // SAFETY: looking up a symbol in a library this process loaded.
+        let p = unsafe { dlsym(self.handle, c.as_ptr()) };
+        if p.is_null() {
+            return Err(format!("no symbol {name}"));
+        }
+        Ok(p)
     }
 
     pub fn kernel(&self, name: &str) -> Result<KernelFn, String> {

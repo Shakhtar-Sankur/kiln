@@ -1,0 +1,163 @@
+//! The GPU backend on the committed tiny models, against PyTorch's
+//! outputs: on kiln's emulator of the CUDA execution model always, on a
+//! real GPU when one is present, with every optimization switched off in
+//! turn, with matmul schedules drawn from the tuner's whole space and with
+//! every row-kernel group width. With NVRTC available, every kernel is
+//! also compiled for the T4's and the A100's architectures.
+
+use kiln::fuse::{self, FuseOpts, Kernel, Step};
+use kiln::gpu::codegen::{MmParams, mm_space};
+use kiln::gpu::{Device, GpuExecutable, GpuOptions};
+use kiln::graph::Graph;
+use kiln::interp::Feeds;
+use kiln::reffile::{self, Reference};
+use kiln::runtime::matmul_signature;
+use kiln::tensor::Tensor;
+use std::collections::HashMap;
+use std::path::Path;
+
+const MODELS: [&str; 3] = ["mlp_tiny", "bert_tiny", "llama_tiny"];
+
+fn load(name: &str) -> (Graph, Reference, Feeds) {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut g = kiln::onnx::load(&dir.join(format!("{name}.onnx"))).unwrap();
+    kiln::passes::optimize(&mut g).unwrap();
+    let r = reffile::load(&dir.join(format!("{name}.ref"))).unwrap();
+    let mut feeds = HashMap::new();
+    for (n, t) in &r.inputs {
+        let v = *g.inputs.iter().find(|&&i| &g.values[i].name == n).unwrap();
+        feeds.insert(v, t.clone());
+    }
+    (g, r, feeds)
+}
+
+fn check(what: &str, g: &Graph, outs: &HashMap<usize, Tensor>, r: &Reference) {
+    for (n, want) in &r.outputs {
+        let o = g.outputs.iter().find(|&&i| &g.values[i].name == n).unwrap();
+        let got = &outs[o];
+        assert_eq!(got.shape, want.shape, "{what}");
+        let scale = want.as_f32().iter().fold(1f32, |m, v| m.max(v.abs()));
+        let d = got
+            .as_f32()
+            .iter()
+            .zip(want.as_f32())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(d <= 1e-5 * scale, "{what}: max |diff| {d} (scale {scale})");
+    }
+}
+
+fn devices() -> Vec<Device> {
+    let mut d = vec![Device::Emu];
+    match kiln::gpu::driver::Cuda::open() {
+        Ok(c) => {
+            eprintln!("also testing on {}", c.name);
+            d.push(Device::Cuda);
+        }
+        Err(e) => eprintln!("no GPU ({e}): emulator only"),
+    }
+    d
+}
+
+fn run(m: &str, fo: FuseOpts, dev: Device, tweak: impl Fn(&fuse::Plan, &mut GpuOptions)) {
+    let (g, r, f) = load(m);
+    let plan = fuse::plan_with(g, fo).unwrap();
+    let mut opts = GpuOptions::new(dev);
+    tweak(&plan, &mut opts);
+    let what = format!("{m} on {dev:?} {fo:?} tpr {:?} mm {:?}", opts.tpr, opts.mm);
+    let mut ex = GpuExecutable::build(plan, &opts).unwrap();
+    // Twice: the second run reuses buffers (and replays CUDA graphs).
+    ex.run(&f).unwrap();
+    let outs = ex.run(&f).unwrap();
+    check(&what, ex.graph(), &outs, &r);
+}
+
+#[test]
+fn gpu_kernels_match_pytorch_with_each_optimization_off() {
+    let all = FuseOpts::default();
+    for dev in devices() {
+        for m in MODELS {
+            for fo in [
+                all,
+                FuseOpts {
+                    epilogue: false,
+                    ..all
+                },
+                FuseOpts { rows: false, ..all },
+                FuseOpts {
+                    inline: false,
+                    ..all
+                },
+                FuseOpts { fold: false, ..all },
+            ] {
+                run(m, fo, dev, |_, _| {});
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_kernels_match_pytorch_under_every_schedule() {
+    // Each round gives every matmul a different schedule from the tuner's
+    // space and every row kernel a different group width, so that across
+    // rounds each schedule and width meets each model.
+    let space = mm_space();
+    for dev in devices() {
+        let rounds = if dev == Device::Emu { 4 } else { space.len() };
+        for round in 0..rounds {
+            for m in MODELS {
+                run(m, FuseOpts::default(), dev, |plan, opts| {
+                    opts.tpr = Some([1, 8, 32, 64, 256][round % 5]);
+                    let mut i = round * 7;
+                    for s in &plan.steps {
+                        if let Step::Kernel(Kernel::Matmul(mk)) = s {
+                            let p: MmParams = space[i % space.len()];
+                            opts.mm.insert(matmul_signature(mk), p);
+                            i += 3;
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn gpu_kernels_compile_for_t4_and_a100() {
+    let nv = match kiln::gpu::driver::Nvrtc::open() {
+        Ok(nv) => nv,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    for m in MODELS {
+        let (g, _, _) = load(m);
+        let plan = fuse::plan(g).unwrap();
+        // The default schedules, and every schedule of the space.
+        let mut sources =
+            vec![kiln::gpu::generate(&plan, &GpuOptions::new(Device::Cuda), 40).source];
+        for p in mm_space() {
+            let mut o = GpuOptions::new(Device::Cuda);
+            for s in &plan.steps {
+                if let Step::Kernel(Kernel::Matmul(mk)) = s {
+                    o.mm.insert(matmul_signature(mk), p);
+                }
+            }
+            sources.push(kiln::gpu::generate(&plan, &o, 40).source);
+        }
+        for (i, src) in sources.iter().enumerate() {
+            for arch in if i == 0 { vec![75, 80] } else { vec![75] } {
+                let (_, log) = nv.compile(src, arch, true).unwrap();
+                // The default schedules must not spill registers (others
+                // may; the tuner times them like any schedule).
+                assert!(
+                    i > 0
+                        || !log.lines().any(|l| l.contains("bytes spill stores")
+                            && !l.contains(" 0 bytes spill stores")),
+                    "{m} sm_{arch}: register spills\n{log}"
+                );
+            }
+        }
+    }
+}

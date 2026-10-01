@@ -1,8 +1,9 @@
-//! kiln: an ML compiler from ONNX graphs to fused, auto-tuned CPU kernels.
+//! kiln: an ML compiler from ONNX graphs to fused, auto-tuned CPU and GPU kernels.
 
 pub mod codegen;
 pub mod eval;
 pub mod fuse;
+pub mod gpu;
 pub mod graph;
 pub mod interp;
 pub mod ir;

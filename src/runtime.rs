@@ -97,7 +97,89 @@ pub fn plan_memory(bufs: &[(usize, usize, usize, usize)]) -> (HashMap<usize, usi
     (out, total)
 }
 
-fn pack(
+/// The arena: lifetimes (in steps) of every materialized value, given each
+/// kernel step's arguments in order, packed by `plan_memory`. Returns the
+/// offsets, the arena size and the sum of all buffer sizes (in floats).
+pub fn arena_layout(plan: &Plan, kernel_args: &[&[Arg]]) -> (HashMap<usize, usize>, usize, usize) {
+    let g = &plan.g;
+    let nsteps = plan.steps.len();
+    let mut start: HashMap<usize, usize> = HashMap::new();
+    let mut end: HashMap<usize, usize> = HashMap::new();
+    let touch = |v: usize,
+                 s: usize,
+                 write: bool,
+                 start: &mut HashMap<usize, usize>,
+                 end: &mut HashMap<usize, usize>| {
+        if write {
+            start.entry(v).or_insert(s);
+        }
+        let e = end.entry(v).or_insert(s);
+        *e = (*e).max(s);
+    };
+    for &v in &g.inputs {
+        if plan.materialized[v] {
+            touch(v, 0, true, &mut start, &mut end);
+        }
+    }
+    let mut args_iter = kernel_args.iter();
+    for (si, step) in plan.steps.iter().enumerate() {
+        match step {
+            Step::Host(p) => {
+                let n = &g.nodes[*p];
+                for &i in n.inputs.iter().flatten() {
+                    if plan.materialized[i] {
+                        touch(i, si, false, &mut start, &mut end);
+                    }
+                }
+                for &o in &n.outputs {
+                    if plan.materialized[o] {
+                        touch(o, si, true, &mut start, &mut end);
+                    }
+                }
+            }
+            Step::Kernel(k) => {
+                let args = args_iter.next().unwrap();
+                let outs: Vec<usize> = match k {
+                    Kernel::Loop(l) => l
+                        .stages
+                        .iter()
+                        .filter_map(|s| {
+                            if let crate::fuse::Stage::Store { out, .. } = s {
+                                Some(*out)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                    Kernel::Matmul(mk) => vec![mk.out],
+                };
+                for a in args.iter() {
+                    if let Arg::Value(v) = a
+                        && plan.materialized[*v]
+                    {
+                        touch(*v, si, outs.contains(v), &mut start, &mut end);
+                    }
+                }
+            }
+        }
+    }
+    for &o in &g.outputs {
+        if plan.materialized[o] {
+            end.insert(o, nsteps);
+        }
+    }
+    let bufs: Vec<(usize, usize, usize, usize)> = start
+        .iter()
+        .map(|(&v, &s)| (v, numel(g.shape(v)), s, end[&v]))
+        .collect();
+    let naive: usize = bufs.iter().map(|b| b.1.div_ceil(16) * 16).sum();
+    let (offsets, total) = plan_memory(&bufs);
+    (offsets, total, naive)
+}
+
+/// Packs a constant matmul operand into panels of width `nr`: panel p
+/// holds rows k = 0..K of columns p·nr..(p+1)·nr, zero-padded.
+pub fn pack(
     t: &Tensor,
     lin: &crate::ir::Lin,
     k: usize,
@@ -178,79 +260,8 @@ impl Executable {
             }
         }
         let lib = jit::compile(&c)?;
-        // Memory: lifetimes of every materialized f32 value.
-        let nsteps = plan.steps.len();
-        let mut start: HashMap<usize, usize> = HashMap::new();
-        let mut end: HashMap<usize, usize> = HashMap::new();
-        let touch = |v: usize,
-                     s: usize,
-                     write: bool,
-                     start: &mut HashMap<usize, usize>,
-                     end: &mut HashMap<usize, usize>| {
-            if write {
-                start.entry(v).or_insert(s);
-            }
-            let e = end.entry(v).or_insert(s);
-            *e = (*e).max(s);
-        };
-        for &v in &g.inputs {
-            if plan.materialized[v] {
-                touch(v, 0, true, &mut start, &mut end);
-            }
-        }
-        let mut src_iter = srcs.iter();
-        for (si, step) in plan.steps.iter().enumerate() {
-            match step {
-                Step::Host(p) => {
-                    let n = &g.nodes[*p];
-                    for &i in n.inputs.iter().flatten() {
-                        if plan.materialized[i] {
-                            touch(i, si, false, &mut start, &mut end);
-                        }
-                    }
-                    for &o in &n.outputs {
-                        if plan.materialized[o] {
-                            touch(o, si, true, &mut start, &mut end);
-                        }
-                    }
-                }
-                Step::Kernel(k) => {
-                    let (src, _) = src_iter.next().unwrap();
-                    let outs: Vec<usize> = match k {
-                        Kernel::Loop(l) => l
-                            .stages
-                            .iter()
-                            .filter_map(|s| {
-                                if let crate::fuse::Stage::Store { out, .. } = s {
-                                    Some(*out)
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect(),
-                        Kernel::Matmul(mk) => vec![mk.out],
-                    };
-                    for a in &src.args {
-                        if let Arg::Value(v) = a
-                            && plan.materialized[*v]
-                        {
-                            touch(*v, si, outs.contains(v), &mut start, &mut end);
-                        }
-                    }
-                }
-            }
-        }
-        for &o in &g.outputs {
-            if plan.materialized[o] {
-                end.insert(o, nsteps);
-            }
-        }
-        let bufs: Vec<(usize, usize, usize, usize)> = start
-            .iter()
-            .map(|(&v, &s)| (v, numel(g.shape(v)), s, end[&v]))
-            .collect();
-        let naive: usize = bufs.iter().map(|b| b.1.div_ceil(16) * 16).sum();
-        let (offsets, total) = plan_memory(&bufs);
+        let kargs: Vec<&[Arg]> = srcs.iter().map(|(s, _)| s.args.as_slice()).collect();
+        let (offsets, total, naive) = arena_layout(&plan, &kargs);
         let mut arena = vec![0f32; total.max(16)];
         let base = arena.as_mut_ptr();
         // Packed weights, shared between kernels using the same layout.

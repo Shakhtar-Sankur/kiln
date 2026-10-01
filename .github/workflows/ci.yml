@@ -18,7 +18,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --release --all-targets -- -D warnings
-      - name: tests (vector width chosen for this CPU)
+      - name: NVRTC, to compile the CUDA kernels without a GPU
+        run: |
+          pip install --quiet nvidia-cuda-nvrtc-cu12
+          echo "KILN_NVRTC=$(python3 -c 'import nvidia.cuda_nvrtc, os; print(os.path.join(nvidia.cuda_nvrtc.__path__[0], "lib", "libnvrtc.so.12"))')" >> "$GITHUB_ENV"
+      - name: tests (vector width chosen for this CPU; CUDA kernels on the emulator and through NVRTC)
         run: cargo test --release
       - name: generated code with 8-lane (AVX2-width) vectors
         run: KILN_VEC=8 cargo test --release --test models
@@ -27,4 +31,8 @@ jobs:
           cargo build --release
           for m in mlp_tiny bert_tiny llama_tiny; do
             ./target/release/kiln run tests/fixtures/$m.onnx tests/fixtures/$m.ref --iters 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+          for m in mlp_tiny bert_tiny llama_tiny; do
+            ./target/release/kiln run tests/fixtures/$m.onnx tests/fixtures/$m.ref --device emu --iters 1 | tee -a "$GITHUB_STEP_SUMMARY"
+            ./target/release/kiln cuda-check tests/fixtures/$m.onnx tests/fixtures/$m.ref --arch 75 | tail -2 | tee -a "$GITHUB_STEP_SUMMARY"
           done
