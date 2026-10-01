@@ -19,7 +19,7 @@ def esc(s):
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def grouped(path, title, subtitle, groups, unit, note):
+def grouped(path, title, subtitle, groups, unit, note, digits=1):
     """Horizontal bars in sections: groups is [(section title, [(label, value, strong)])];
     each section has its own scale."""
     left, right, band, head = 150, 120, 30, 34
@@ -42,10 +42,10 @@ def grouped(path, title, subtitle, groups, unit, note):
             color = STRONG if strong else WEAK
             out.append(
                 f'<path d="M{left},{y} h{w - 4:.1f} a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h{-(w - 4):.1f} z" fill="{color}">'
-                f"<title>{esc(label)}: {v:.1f} {esc(unit)}</title></path>"
+                f"<title>{esc(label)}: {v:.{digits}f} {esc(unit)}</title></path>"
             )
             out.append(f'<text x="{left - 12}" y="{y + 14}" font-size="13" fill="{TEXT}" text-anchor="end">{esc(label)}</text>')
-            out.append(f'<text x="{left + w + 8:.1f}" y="{y + 14}" font-size="13" font-weight="600" fill="{TEXT}">{v:.1f} <tspan font-weight="400" fill="{TEXT2}">{esc(unit)}</tspan></text>')
+            out.append(f'<text x="{left + w + 8:.1f}" y="{y + 14}" font-size="13" font-weight="600" fill="{TEXT}">{v:.{digits}f} <tspan font-weight="400" fill="{TEXT2}">{esc(unit)}</tspan></text>')
         y0 += band * len(rows) + 14
     out.append(f'<text x="24" y="{h - 14}" font-size="12" fill="{TEXT2}">{esc(note)}</text>')
     out.append("</svg>")

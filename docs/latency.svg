@@ -3,52 +3,52 @@
 <text x="24" y="34" font-size="17" font-weight="600" fill="#0b0b0b">Inference latency: kiln against four production stacks</text>
 <text x="24" y="56" font-size="13" fill="#52514e">Median milliseconds, lower is better; same machine, same 4 threads, same inputs</text>
 <text x="24" y="98" font-size="13" font-weight="600" fill="#0b0b0b">BERT, bge-small-en-v1.5: 8 sequences x 128 tokens</text>
-<path d="M150,119.0 h296.9 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-296.9 z" fill="#2a78d6"><title>kiln: 126.3 ms</title></path>
+<path d="M150,119.0 h249.8 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-249.8 z" fill="#2a78d6"><title>kiln: 117.1 ms</title></path>
 <text x="138" y="133.0" font-size="13" fill="#0b0b0b" text-anchor="end">kiln</text>
-<text x="458.9" y="133.0" font-size="13" font-weight="600" fill="#0b0b0b">126.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,149.0 h313.2 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-313.2 z" fill="#9ec5f4"><title>torch.compile: 133.1 ms</title></path>
+<text x="411.8" y="133.0" font-size="13" font-weight="600" fill="#0b0b0b">117.1 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,149.0 h318.3 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-318.3 z" fill="#9ec5f4"><title>torch.compile: 148.7 ms</title></path>
 <text x="138" y="163.0" font-size="13" fill="#0b0b0b" text-anchor="end">torch.compile</text>
-<text x="475.2" y="163.0" font-size="13" font-weight="600" fill="#0b0b0b">133.1 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,179.0 h343.5 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-343.5 z" fill="#9ec5f4"><title>ONNX Runtime: 145.8 ms</title></path>
+<text x="480.3" y="163.0" font-size="13" font-weight="600" fill="#0b0b0b">148.7 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,179.0 h326.8 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-326.8 z" fill="#9ec5f4"><title>ONNX Runtime: 152.7 ms</title></path>
 <text x="138" y="193.0" font-size="13" fill="#0b0b0b" text-anchor="end">ONNX Runtime</text>
-<text x="505.5" y="193.0" font-size="13" font-weight="600" fill="#0b0b0b">145.8 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,209.0 h401.8 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-401.8 z" fill="#9ec5f4"><title>JAX / XLA: 170.3 ms</title></path>
+<text x="488.8" y="193.0" font-size="13" font-weight="600" fill="#0b0b0b">152.7 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,209.0 h404.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-404.6 z" fill="#9ec5f4"><title>JAX / XLA: 188.6 ms</title></path>
 <text x="138" y="223.0" font-size="13" fill="#0b0b0b" text-anchor="end">JAX / XLA</text>
-<text x="563.8" y="223.0" font-size="13" font-weight="600" fill="#0b0b0b">170.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,239.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>PyTorch eager: 179.8 ms</title></path>
+<text x="566.6" y="223.0" font-size="13" font-weight="600" fill="#0b0b0b">188.6 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,239.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>PyTorch eager: 197.8 ms</title></path>
 <text x="138" y="253.0" font-size="13" fill="#0b0b0b" text-anchor="end">PyTorch eager</text>
-<text x="586.6" y="253.0" font-size="13" font-weight="600" fill="#0b0b0b">179.8 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<text x="586.6" y="253.0" font-size="13" font-weight="600" fill="#0b0b0b">197.8 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
 <text x="24" y="296" font-size="13" font-weight="600" fill="#0b0b0b">SmolLM2-135M: 128-token prefill</text>
-<path d="M150,317.0 h313.8 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-313.8 z" fill="#2a78d6"><title>kiln: 102.0 ms</title></path>
+<path d="M150,317.0 h334.0 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-334.0 z" fill="#2a78d6"><title>kiln: 115.9 ms</title></path>
 <text x="138" y="331.0" font-size="13" fill="#0b0b0b" text-anchor="end">kiln</text>
-<text x="475.8" y="331.0" font-size="13" font-weight="600" fill="#0b0b0b">102.0 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,347.0 h336.2 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-336.2 z" fill="#9ec5f4"><title>torch.compile: 109.2 ms</title></path>
+<text x="496.0" y="331.0" font-size="13" font-weight="600" fill="#0b0b0b">115.9 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,347.0 h354.5 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-354.5 z" fill="#9ec5f4"><title>torch.compile: 122.9 ms</title></path>
 <text x="138" y="361.0" font-size="13" fill="#0b0b0b" text-anchor="end">torch.compile</text>
-<text x="498.2" y="361.0" font-size="13" font-weight="600" fill="#0b0b0b">109.2 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,377.0 h340.1 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-340.1 z" fill="#9ec5f4"><title>ONNX Runtime: 110.5 ms</title></path>
+<text x="516.5" y="361.0" font-size="13" font-weight="600" fill="#0b0b0b">122.9 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,377.0 h349.0 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-349.0 z" fill="#9ec5f4"><title>ONNX Runtime: 121.0 ms</title></path>
 <text x="138" y="391.0" font-size="13" fill="#0b0b0b" text-anchor="end">ONNX Runtime</text>
-<text x="502.1" y="391.0" font-size="13" font-weight="600" fill="#0b0b0b">110.5 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,407.0 h389.8 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-389.8 z" fill="#9ec5f4"><title>JAX / XLA: 126.4 ms</title></path>
+<text x="511.0" y="391.0" font-size="13" font-weight="600" fill="#0b0b0b">121.0 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,407.0 h410.5 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-410.5 z" fill="#9ec5f4"><title>JAX / XLA: 142.1 ms</title></path>
 <text x="138" y="421.0" font-size="13" fill="#0b0b0b" text-anchor="end">JAX / XLA</text>
-<text x="551.8" y="421.0" font-size="13" font-weight="600" fill="#0b0b0b">126.4 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,437.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>PyTorch eager: 137.6 ms</title></path>
+<text x="572.5" y="421.0" font-size="13" font-weight="600" fill="#0b0b0b">142.1 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,437.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>PyTorch eager: 146.9 ms</title></path>
 <text x="138" y="451.0" font-size="13" fill="#0b0b0b" text-anchor="end">PyTorch eager</text>
-<text x="586.6" y="451.0" font-size="13" font-weight="600" fill="#0b0b0b">137.6 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<text x="586.6" y="451.0" font-size="13" font-weight="600" fill="#0b0b0b">146.9 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
 <text x="24" y="494" font-size="13" font-weight="600" fill="#0b0b0b">MLP: 4 pre-norm GELU blocks, 64 x 512</text>
-<path d="M150,515.0 h218.9 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-218.9 z" fill="#2a78d6"><title>kiln: 2.7 ms</title></path>
+<path d="M150,515.0 h180.5 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-180.5 z" fill="#2a78d6"><title>kiln: 2.7 ms</title></path>
 <text x="138" y="529.0" font-size="13" fill="#0b0b0b" text-anchor="end">kiln</text>
-<text x="380.9" y="529.0" font-size="13" font-weight="600" fill="#0b0b0b">2.7 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,545.0 h381.4 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-381.4 z" fill="#9ec5f4"><title>torch.compile: 4.8 ms</title></path>
+<text x="342.5" y="529.0" font-size="13" font-weight="600" fill="#0b0b0b">2.7 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,545.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>torch.compile: 6.3 ms</title></path>
 <text x="138" y="559.0" font-size="13" fill="#0b0b0b" text-anchor="end">torch.compile</text>
-<text x="543.4" y="559.0" font-size="13" font-weight="600" fill="#0b0b0b">4.8 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,575.0 h230.0 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-230.0 z" fill="#9ec5f4"><title>ONNX Runtime: 2.9 ms</title></path>
+<text x="586.6" y="559.0" font-size="13" font-weight="600" fill="#0b0b0b">6.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,575.0 h220.4 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-220.4 z" fill="#9ec5f4"><title>ONNX Runtime: 3.3 ms</title></path>
 <text x="138" y="589.0" font-size="13" fill="#0b0b0b" text-anchor="end">ONNX Runtime</text>
-<text x="392.0" y="589.0" font-size="13" font-weight="600" fill="#0b0b0b">2.9 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,605.0 h348.5 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-348.5 z" fill="#9ec5f4"><title>JAX / XLA: 4.3 ms</title></path>
+<text x="382.4" y="589.0" font-size="13" font-weight="600" fill="#0b0b0b">3.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,605.0 h332.2 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-332.2 z" fill="#9ec5f4"><title>JAX / XLA: 5.0 ms</title></path>
 <text x="138" y="619.0" font-size="13" fill="#0b0b0b" text-anchor="end">JAX / XLA</text>
-<text x="510.5" y="619.0" font-size="13" font-weight="600" fill="#0b0b0b">4.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
-<path d="M150,635.0 h424.6 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-424.6 z" fill="#9ec5f4"><title>PyTorch eager: 5.3 ms</title></path>
+<text x="494.2" y="619.0" font-size="13" font-weight="600" fill="#0b0b0b">5.0 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<path d="M150,635.0 h384.7 a4,4 0 0 1 4,4 v12 a4,4 0 0 1 -4,4 h-384.7 z" fill="#9ec5f4"><title>PyTorch eager: 5.7 ms</title></path>
 <text x="138" y="649.0" font-size="13" fill="#0b0b0b" text-anchor="end">PyTorch eager</text>
-<text x="586.6" y="649.0" font-size="13" font-weight="600" fill="#0b0b0b">5.3 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
+<text x="546.7" y="649.0" font-size="13" font-weight="600" fill="#0b0b0b">5.7 <tspan font-weight="400" fill="#52514e">ms</tspan></text>
 <text x="24" y="690" font-size="12" fill="#52514e">4 vCPUs (Xeon, AVX-512). Every engine's output is checked against PyTorch's before timing.</text>
 </svg>

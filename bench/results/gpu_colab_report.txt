@@ -1,0 +1,213 @@
+kiln on a Colab T4: the report of scripts/colab.sh for the run whose timings
+are in gpu_runs.jsonl (summary: gpu_summary.md). The benchmark section's
+per-configuration compile messages are left out; everything else is as
+printed.
+
+=== machine ===
+name, driver_version, memory.total [MiB], clocks.max.sm [MHz]
+Tesla T4, 580.82.07, 15360 MiB, 1590 MHz
+2
+kiln c4cf679 GPU matmuls: split-K and vectorized register tiles
+
+=== toolchain ===
+rustc 1.98.1 (48a229cea 2026-09-01)
+onnxruntime CUDA provider works (onnxruntime-gpu latest)
+torch 2.11.0+cu128 cuda 12.8 | transformers 5.16.1 | onnxruntime 1.23.2 ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
+jax 0.11.1 [CudaDevice(id=0)]
+/usr/local/cuda/lib64/libnvrtc.so
+
+=== models ===
+models already exported
+
+=== build ===
+   Compiling kiln v0.1.0 (/content/kiln)
+    Finished `release` profile [optimized] target(s) in 29.40s
+
+=== GPU tests (on this GPU) ===
+test gpu_kernels_compile_for_t4_and_a100 ... ok
+also testing on Tesla T4
+also testing on Tesla T4
+test fused_attention_applies_and_matches_pytorch ... ok
+also testing on Tesla T4
+test gpu_kernels_match_pytorch_with_each_optimization_off ... ok
+also testing on Tesla T4
+test gpu_kernels_match_pytorch_under_every_schedule has been running for over 60 seconds
+test gpu_tensor_core_kernels_match_pytorch_with_each_optimization_off ... ok
+also testing on Tesla T4
+test gpu_kernels_match_pytorch_under_every_schedule ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 402.32s
+
+=== first run, tuning and per-kernel profile ===
+--- mlp
+tuned b1_m64_n2048_k512_packed: MmParams { bm: 32, bn: 32, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.056 ms (2376 GFLOPS) of 60 schedules in 23.8 s
+tuned b1_m64_n512_k2048_packed: MmParams { bm: 32, bn: 32, bk: 32, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.071 ms (1895 GFLOPS) of 60 schedules in 18.4 s
+Tesla T4 (sm_75): compiled in 43.08 s (NVRTC/C++ 0.49 s): 12 kernels (3 distinct, 440 lines of CUDA), 0 host steps
+memory plan: 0.8 MB arena for 3.3 MB of intermediates
+y: max |diff| 2.146e-6 (max |value| 4.351)
+   55.6%     0.592 ms  x4    matmul b1_m64_n512_k2048_packed k2
+   40.3%     0.429 ms  x4    matmul b1_m64_n2048_k512_packed k1
+    4.1%     0.044 ms  x4    rows 64 x 512 (4 stages) k0
+latency: median 1.072 ms, min 1.070 ms over 20 runs, Tesla T4 (sm_75)
+--- mlp fp16 tensor cores
+tuned b1_m64_n2048_k512_packed_f16: MmParams { bm: 64, bn: 64, bk: 64, tm: 2, tn: 2, tc: true, ks: 1, vec: false } 0.044 ms (3034 GFLOPS) of 51 schedules in 20.6 s
+tuned b1_m64_n512_k2048_packed_f16: MmParams { bm: 32, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.043 ms (3151 GFLOPS) of 51 schedules in 12.4 s
+Tesla T4 (sm_75), fp16 tensor cores: compiled in 34.11 s (NVRTC/C++ 0.73 s): 12 kernels (3 distinct, 450 lines of CUDA), 0 host steps
+memory plan: 0.8 MB arena for 3.3 MB of intermediates
+y: max |diff| 7.325e-4 (max |value| 4.351)
+   61.1%     0.373 ms  x4    matmul b1_m64_n512_k2048_packed k2
+   30.9%     0.189 ms  x4    matmul b1_m64_n2048_k512_packed k1
+    8.0%     0.049 ms  x4    rows 64 x 512 (4 stages) k0
+latency: median 0.618 ms, min 0.616 ms over 20 runs, Tesla T4 (sm_75), fp16 tensor cores
+--- bert
+tuned b1_m1024_n384_k384_packed: MmParams { bm: 64, bn: 64, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.096 ms (3136 GFLOPS) of 60 schedules in 17.4 s
+tuned b96_m128_n128_k32_expr: MmParams { bm: 64, bn: 64, bk: 32, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.075 ms (1334 GFLOPS) of 50 schedules in 15.5 s
+tuned b96_m128_n32_k128_expr: MmParams { bm: 32, bn: 32, bk: 32, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.059 ms (1719 GFLOPS) of 56 schedules in 17.5 s
+tuned b8_m128_n384_k384_packed: MmParams { bm: 32, bn: 32, bk: 8, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.125 ms (2423 GFLOPS) of 60 schedules in 20.0 s
+tuned b1_m1024_n1536_k384_packed: MmParams { bm: 128, bn: 64, bk: 8, tm: 8, tn: 4, tc: false, ks: 1, vec: true } 0.303 ms (3983 GFLOPS) of 60 schedules in 27.0 s
+tuned b1_m1024_n384_k1536_packed: MmParams { bm: 128, bn: 64, bk: 32, tm: 8, tn: 4, tc: false, ks: 4, vec: true } 0.371 ms (3256 GFLOPS) of 60 schedules in 19.8 s
+Tesla T4 (sm_75): compiled in 118.91 s (NVRTC/C++ 1.38 s): 135 kernels (12 distinct, 888 lines of CUDA), 1 host steps
+memory plan: 16.3 MB arena for 381.2 MB of intermediates
+embedding: max |diff| 1.751e-7 (max |value| 0.495)
+   24.8%     4.938 ms  x36   matmul b1_m1024_n384_k384_packed k2
+   24.7%     4.915 ms  x12   matmul b1_m1024_n384_k1536_packed k9
+   22.3%     4.447 ms  x12   matmul b1_m1024_n1536_k384_packed k8
+   10.3%     2.054 ms  x12   matmul b8_m128_n384_k384_packed k6
+    5.1%     1.025 ms  x12   rows 12288 x 128 (4 stages) k4
+    4.9%     0.978 ms  x12   matmul b96_m128_n128_k32_expr k3
+    4.2%     0.827 ms  x12   matmul b96_m128_n32_k128_expr k5
+    3.2%     0.644 ms  x23   rows 1024 x 384 (4 stages) k7
+    0.2%     0.031 ms  x1    rows 1024 x 384 (5 stages) k0
+    0.1%     0.024 ms  x1    rows 1024 x 384 (4 stages) k10
+    0.0%     0.009 ms  x1    rows 1024 x 128 (1 stages) k1
+    0.0%     0.008 ms  x1    rows 8 x 384 (2 stages) k11
+    0.0%     0.000 ms  x1    host Gather
+latency: median 20.408 ms, min 19.853 ms over 20 runs, Tesla T4 (sm_75)
+--- bert fp16 tensor cores
+tuned b1_m1024_n384_k384_packed_f16: MmParams { bm: 64, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.060 ms (5042 GFLOPS) of 48 schedules in 12.5 s
+tuned b96_m128_n128_k32_expr_f16: MmParams { bm: 16, bn: 64, bk: 32, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.084 ms (1199 GFLOPS) of 39 schedules in 8.9 s
+tuned b96_m128_n32_k128_expr_f16: MmParams { bm: 128, bn: 32, bk: 32, tm: 4, tn: 1, tc: true, ks: 1, vec: false } 0.064 ms (1562 GFLOPS) of 44 schedules in 12.7 s
+tuned b8_m128_n384_k384_packed_f16: MmParams { bm: 16, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.063 ms (4803 GFLOPS) of 50 schedules in 23.0 s
+tuned b1_m1024_n1536_k384_packed_f16: MmParams { bm: 64, bn: 128, bk: 64, tm: 2, tn: 4, tc: true, ks: 1, vec: false } 0.138 ms (8764 GFLOPS) of 49 schedules in 19.4 s
+tuned b1_m1024_n384_k1536_packed_f16: MmParams { bm: 64, bn: 64, bk: 64, tm: 2, tn: 2, tc: true, ks: 1, vec: false } 0.117 ms (10286 GFLOPS) of 51 schedules in 13.3 s
+Tesla T4 (sm_75), fp16 tensor cores: compiled in 91.91 s (NVRTC/C++ 1.90 s): 135 kernels (12 distinct, 905 lines of CUDA), 1 host steps
+memory plan: 16.3 MB arena for 381.2 MB of intermediates
+embedding: max |diff| 1.187e-4 (max |value| 0.495)
+   17.7%     1.608 ms  x36   matmul b1_m1024_n384_k384_packed k2
+   16.7%     1.513 ms  x12   matmul b1_m1024_n1536_k384_packed k8
+   16.3%     1.477 ms  x12   matmul b1_m1024_n384_k1536_packed k9
+   12.3%     1.113 ms  x12   rows 12288 x 128 (4 stages) k4
+   11.3%     1.024 ms  x12   matmul b96_m128_n128_k32_expr k3
+    9.9%     0.897 ms  x12   matmul b8_m128_n384_k384_packed k6
+    7.5%     0.681 ms  x12   matmul b96_m128_n32_k128_expr k5
+    7.4%     0.675 ms  x23   rows 1024 x 384 (4 stages) k7
+    0.4%     0.033 ms  x1    rows 1024 x 384 (5 stages) k0
+    0.3%     0.026 ms  x1    rows 1024 x 384 (4 stages) k10
+    0.1%     0.010 ms  x1    rows 1024 x 128 (1 stages) k1
+    0.1%     0.009 ms  x1    rows 8 x 384 (2 stages) k11
+    0.0%     0.000 ms  x1    host Gather
+latency: median 11.404 ms, min 9.366 ms over 20 runs, Tesla T4 (sm_75), fp16 tensor cores
+--- llama
+tuned b1_m128_n576_k576_packed: MmParams { bm: 32, bn: 32, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.049 ms (1735 GFLOPS) of 60 schedules in 16.8 s
+tuned b1_m128_n192_k576_packed: MmParams { bm: 32, bn: 32, bk: 32, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.022 ms (1265 GFLOPS) of 60 schedules in 16.4 s
+tuned b9_m128_n128_k64_expr: MmParams { bm: 64, bn: 64, bk: 16, tm: 4, tn: 4, tc: false, ks: 2, vec: true } 0.025 ms (743 GFLOPS) of 55 schedules in 18.8 s
+tuned b9_m128_n64_k128_expr: MmParams { bm: 32, bn: 32, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.021 ms (919 GFLOPS) of 56 schedules in 15.5 s
+tuned b1_m128_n1536_k576_packed: MmParams { bm: 32, bn: 32, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.086 ms (2640 GFLOPS) of 60 schedules in 16.7 s
+tuned b1_m128_n576_k1536_packed: MmParams { bm: 32, bn: 32, bk: 16, tm: 4, tn: 4, tc: false, ks: 1, vec: true } 0.108 ms (2105 GFLOPS) of 60 schedules in 18.8 s
+tuned b1_m128_n49152_k576_packed: MmParams { bm: 128, bn: 128, bk: 32, tm: 8, tn: 8, tc: false, ks: 1, vec: false } 1.906 ms (3802 GFLOPS) of 60 schedules in 32.2 s
+Tesla T4 (sm_75): compiled in 138.36 s (NVRTC/C++ 2.30 s): 422 kernels (13 distinct, 965 lines of CUDA), 1 host steps
+memory plan: 25.5 MB arena for 179.1 MB of intermediates
+logits: max |diff| 2.022e-4 (max |value| 37.155)
+   18.7%     3.622 ms  x30   matmul b1_m128_n576_k1536_packed k11
+   16.3%     3.160 ms  x30   matmul b1_m128_n1536_k576_packed k10
+   15.4%     2.987 ms  x30   matmul b1_m128_n1536_k576_packed k9
+   10.2%     1.982 ms  x30   matmul b1_m128_n576_k576_packed k8
+    9.3%     1.802 ms  x60   matmul b1_m128_n192_k576_packed k2
+    9.2%     1.787 ms  x1    matmul b1_m128_n49152_k576_packed k12
+    7.7%     1.488 ms  x30   matmul b1_m128_n576_k576_packed k1
+    3.6%     0.696 ms  x30   matmul b9_m128_n128_k64_expr k5
+    2.7%     0.521 ms  x61   rows 128 x 576 (2 stages) k0
+    2.5%     0.486 ms  x30   matmul b9_m128_n64_k128_expr k7
+    1.9%     0.376 ms  x30   rows 1152 x 128 (4 stages) k6
+    1.2%     0.240 ms  x30   rows 1152 x 64 (1 stages) k3
+    1.1%     0.209 ms  x30   rows 384 x 64 (1 stages) k4
+    0.0%     0.000 ms  x1    host Gather
+latency: median 19.830 ms, min 19.233 ms over 20 runs, Tesla T4 (sm_75)
+--- llama fp16 tensor cores
+tuned b1_m128_n576_k576_packed_f16: MmParams { bm: 16, bn: 64, bk: 32, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.028 ms (2990 GFLOPS) of 51 schedules in 10.8 s
+tuned b1_m128_n192_k576_packed_f16: MmParams { bm: 32, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 3, vec: false } 0.019 ms (1504 GFLOPS) of 51 schedules in 11.1 s
+tuned b9_m128_n128_k64_expr_f16: MmParams { bm: 64, bn: 64, bk: 16, tm: 2, tn: 2, tc: true, ks: 1, vec: false } 0.016 ms (1167 GFLOPS) of 40 schedules in 10.1 s
+tuned b9_m128_n64_k128_expr_f16: MmParams { bm: 64, bn: 32, bk: 64, tm: 2, tn: 1, tc: true, ks: 1, vec: false } 0.017 ms (1137 GFLOPS) of 43 schedules in 12.3 s
+tuned b1_m128_n1536_k576_packed_f16: MmParams { bm: 16, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 1, vec: false } 0.045 ms (5081 GFLOPS) of 51 schedules in 11.9 s
+tuned b1_m128_n576_k1536_packed_f16: MmParams { bm: 32, bn: 64, bk: 64, tm: 1, tn: 2, tc: true, ks: 3, vec: false } 0.056 ms (4076 GFLOPS) of 51 schedules in 12.1 s
+tuned b1_m128_n49152_k576_packed_f16: MmParams { bm: 128, bn: 128, bk: 64, tm: 4, tn: 2, tc: true, ks: 1, vec: false } 0.870 ms (8332 GFLOPS) of 51 schedules in 16.4 s
+Tesla T4 (sm_75), fp16 tensor cores: compiled in 88.88 s (NVRTC/C++ 2.49 s): 422 kernels (13 distinct, 1023 lines of CUDA), 1 host steps
+memory plan: 25.5 MB arena for 179.1 MB of intermediates
+logits: max |diff| 7.694e-2 (max |value| 37.155)
+   14.0%     1.156 ms  x30   matmul b1_m128_n1536_k576_packed k10
+   12.6%     1.039 ms  x30   matmul b1_m128_n1536_k576_packed k9
+   12.0%     0.990 ms  x30   matmul b1_m128_n576_k1536_packed k11
+   10.5%     0.867 ms  x30   matmul b1_m128_n576_k576_packed k8
+   10.1%     0.832 ms  x60   matmul b1_m128_n192_k576_packed k2
+    9.0%     0.745 ms  x30   matmul b1_m128_n576_k576_packed k1
+    8.0%     0.662 ms  x1    matmul b1_m128_n49152_k576_packed k12
+    5.7%     0.470 ms  x61   rows 128 x 576 (2 stages) k0
+    4.3%     0.357 ms  x30   matmul b9_m128_n64_k128_expr k7
+    4.3%     0.355 ms  x30   rows 1152 x 128 (4 stages) k6
+    4.3%     0.352 ms  x30   matmul b9_m128_n128_k64_expr k5
+    2.8%     0.227 ms  x30   rows 1152 x 64 (1 stages) k3
+    2.3%     0.188 ms  x30   rows 384 x 64 (1 stages) k4
+    0.0%     0.000 ms  x1    host Gather
+latency: median 8.510 ms, min 8.177 ms over 20 runs, Tesla T4 (sm_75), fp16 tensor cores
+--- mlp untuned defaults, no CUDA graphs
+y: max |diff| 2.146e-6 (max |value| 4.351)
+latency: median 1.096 ms, min 1.094 ms over 20 runs, Tesla T4 (sm_75)
+--- bert untuned defaults, no CUDA graphs
+embedding: max |diff| 3.278e-7 (max |value| 0.495)
+latency: median 23.396 ms, min 22.810 ms over 20 runs, Tesla T4 (sm_75)
+--- llama untuned defaults, no CUDA graphs
+logits: max |diff| 2.022e-4 (max |value| 37.155)
+latency: median 28.658 ms, min 28.131 ms over 20 runs, Tesla T4 (sm_75)
+--- CPU backend on this machine, for reference
+latency: median 14.222 ms, min 14.118 ms over 5 runs, 2 threads
+latency: median 892.289 ms, min 611.839 ms over 5 runs, 2 threads
+latency: median 439.093 ms, min 428.223 ms over 5 runs, 2 threads
+
+=== benchmark (3 rounds) ===
+(per-configuration compile messages omitted; timings in gpu_runs.jsonl,
+summary in gpu_summary.md)
+
+=== tuner choices ===
+Tesla_T4|attn_b96_m128_n128_k32_expr_b96_m128_n32_k128_expr unfused
+Tesla_T4|attn_b96_m128_n128_k32_expr_b96_m128_n32_k128_expr_f16 unfused
+Tesla_T4|attn_b9_m128_n128_k64_expr_b9_m128_n64_k128_expr unfused
+Tesla_T4|attn_b9_m128_n128_k64_expr_b9_m128_n64_k128_expr_f16 unfused
+Tesla_T4|b1_m1024_n1536_k384_packed 128 64 8 8 4 false 1 true
+Tesla_T4|b1_m1024_n1536_k384_packed_f16 64 128 64 2 4 true 1 false
+Tesla_T4|b1_m1024_n384_k1536_packed 128 64 32 8 4 false 4 true
+Tesla_T4|b1_m1024_n384_k1536_packed_f16 64 64 64 2 2 true 1 false
+Tesla_T4|b1_m1024_n384_k384_packed 64 64 16 4 4 false 1 true
+Tesla_T4|b1_m1024_n384_k384_packed_f16 64 64 64 1 2 true 1 false
+Tesla_T4|b1_m128_n1536_k576_packed 32 32 16 4 4 false 1 true
+Tesla_T4|b1_m128_n1536_k576_packed_f16 16 64 64 1 2 true 1 false
+Tesla_T4|b1_m128_n192_k576_packed 32 32 32 4 4 false 1 true
+Tesla_T4|b1_m128_n192_k576_packed_f16 32 64 64 1 2 true 3 false
+Tesla_T4|b1_m128_n49152_k576_packed 128 128 32 8 8 false 1 false
+Tesla_T4|b1_m128_n49152_k576_packed_f16 128 128 64 4 2 true 1 false
+Tesla_T4|b1_m128_n576_k1536_packed 32 32 16 4 4 false 1 true
+Tesla_T4|b1_m128_n576_k1536_packed_f16 32 64 64 1 2 true 3 false
+Tesla_T4|b1_m128_n576_k576_packed 32 32 16 4 4 false 1 true
+Tesla_T4|b1_m128_n576_k576_packed_f16 16 64 32 1 2 true 1 false
+Tesla_T4|b1_m64_n2048_k512_packed 32 32 16 4 4 false 1 true
+Tesla_T4|b1_m64_n2048_k512_packed_f16 64 64 64 2 2 true 1 false
+Tesla_T4|b1_m64_n512_k2048_packed 32 32 32 4 4 false 1 true
+Tesla_T4|b1_m64_n512_k2048_packed_f16 32 64 64 1 2 true 1 false
+Tesla_T4|b8_m128_n384_k384_packed 32 32 8 4 4 false 1 true
+Tesla_T4|b8_m128_n384_k384_packed_f16 16 64 64 1 2 true 1 false
+Tesla_T4|b96_m128_n128_k32_expr 64 64 32 4 4 false 1 true
+Tesla_T4|b96_m128_n128_k32_expr_f16 16 64 32 1 2 true 1 false
+Tesla_T4|b96_m128_n32_k128_expr 32 32 32 4 4 false 1 true
+Tesla_T4|b96_m128_n32_k128_expr_f16 128 32 32 4 1 true 1 false
+Tesla_T4|b9_m128_n128_k64_expr 64 64 16 4 4 false 1 true
+Tesla_T4|b9_m128_n128_k64_expr_f16 64 64 16 2 2 true 1 false
+Tesla_T4|b9_m128_n64_k128_expr 32 32 16 4 4 false 1 true
+Tesla_T4|b9_m128_n64_k128_expr_f16 64 32 64 2 1 true 1 false
