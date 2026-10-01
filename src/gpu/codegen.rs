@@ -779,7 +779,7 @@ fn mm_names(mk: &MatmulK) -> HashMap<Var, String> {
 /// The A tile (BM x BK): 4-wide along k when A is contiguous in k.
 fn a_tile<'a>(mk: &MatmulK, gx: &Gx, bm: usize, bk: usize, nt: usize) -> Tile<'a> {
     let load = match vec4_index(&mk.a, mk.vk) {
-        Some((b, l)) if mk.k % 4 == 0 && bk % 4 == 0 => {
+        Some((b, l)) if mk.k.is_multiple_of(4) && bk.is_multiple_of(4) => {
             Load::VecK(format!("{} + ({})", gx.buf(b), gx.lin(l)))
         }
         _ => Load::Scalar(gx.e(&mk.a)),
