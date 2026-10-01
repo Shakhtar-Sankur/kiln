@@ -36,7 +36,10 @@ pub struct GpuKernel {
     pub smem: u32,
 }
 
-/// fp32 matmul schedule.
+/// Matmul schedule: a BM x BN block tile staged BK deep. With `tc` false
+/// (fp32 on CUDA cores) each thread holds a TM x TN register tile; with
+/// `tc` (fp16 tensor cores) TM x TN is the grid of warps, each computing a
+/// (BM/TM) x (BN/TN) warp tile out of 16 x 8 mma tiles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MmParams {
     pub bm: usize,
@@ -44,32 +47,82 @@ pub struct MmParams {
     pub bk: usize,
     pub tm: usize,
     pub tn: usize,
+    pub tc: bool,
 }
 
 impl MmParams {
     pub fn threads(&self) -> usize {
-        (self.bm / self.tm) * (self.bn / self.tn)
+        if self.tc {
+            self.tm * self.tn * 32
+        } else {
+            (self.bm / self.tm) * (self.bn / self.tn)
+        }
+    }
+
+    fn valid(&self) -> bool {
+        let t = self.threads();
+        if !(32..=256).contains(&t) {
+            return false;
+        }
+        if self.tc {
+            let (wm, wn) = (self.bm / self.tm, self.bn / self.tn);
+            self.bm.is_multiple_of(self.tm)
+                && self.bn.is_multiple_of(self.tn)
+                && wm.is_multiple_of(16)
+                && wn.is_multiple_of(8)
+                && (wm / 16) * (wn / 8) * 4 <= 128
+                && self.bk.is_multiple_of(8)
+        } else {
+            self.bm.is_multiple_of(self.tm) && self.bn.is_multiple_of(self.tn)
+        }
     }
 }
 
 /// Schedules the tuner and the tests choose from.
-pub fn mm_space() -> Vec<MmParams> {
+pub fn mm_space(tc: bool) -> Vec<MmParams> {
     let mut v = Vec::new();
-    for (bm, bn, tm, tn) in [
-        (128, 128, 8, 8),
-        (128, 64, 8, 4),
-        (64, 128, 4, 8),
-        (64, 64, 4, 4),
-        (64, 64, 8, 8),
-        (64, 32, 4, 2),
-        (32, 64, 2, 4),
-        (32, 32, 2, 2),
-        (32, 32, 4, 4),
-        (16, 64, 1, 4),
-    ] {
-        for bk in [8, 16, 32] {
-            let p = MmParams { bm, bn, bk, tm, tn };
-            if (32..=256).contains(&p.threads()) {
+    let tiles: &[(usize, usize, usize, usize)] = if tc {
+        &[
+            (128, 128, 2, 4),
+            (128, 128, 4, 2),
+            (128, 64, 2, 2),
+            (128, 64, 4, 2),
+            (64, 128, 2, 2),
+            (64, 128, 2, 4),
+            (64, 64, 2, 2),
+            (64, 64, 1, 2),
+            (64, 32, 2, 1),
+            (32, 64, 1, 2),
+            (32, 32, 1, 1),
+            (128, 32, 4, 1),
+            (16, 64, 1, 2),
+        ]
+    } else {
+        &[
+            (128, 128, 8, 8),
+            (128, 64, 8, 4),
+            (64, 128, 4, 8),
+            (64, 64, 4, 4),
+            (64, 64, 8, 8),
+            (64, 32, 4, 2),
+            (32, 64, 2, 4),
+            (32, 32, 2, 2),
+            (32, 32, 4, 4),
+            (16, 64, 1, 4),
+        ]
+    };
+    let bks: &[usize] = if tc { &[16, 32, 64] } else { &[8, 16, 32] };
+    for &(bm, bn, tm, tn) in tiles {
+        for &bk in bks {
+            let p = MmParams {
+                bm,
+                bn,
+                bk,
+                tm,
+                tn,
+                tc,
+            };
+            if p.valid() {
                 v.push(p);
             }
         }
@@ -78,35 +131,43 @@ pub fn mm_space() -> Vec<MmParams> {
 }
 
 /// Largest tile that still gives every streaming multiprocessor work.
-pub fn default_mm(mk: &MatmulK, sms: usize) -> MmParams {
+pub fn default_mm(mk: &MatmulK, sms: usize, tc: bool) -> MmParams {
     let batch: usize = mk.batch.iter().map(|b| b.1).product();
     let tiles = |p: &MmParams| batch * mk.m.div_ceil(p.bm) * mk.n.div_ceil(p.bn);
-    let order = [
-        (128, 128, 8, 8),
-        (128, 64, 8, 4),
-        (64, 64, 4, 4),
-        (64, 32, 4, 2),
-        (32, 32, 2, 2),
-    ];
-    for (bm, bn, tm, tn) in order {
+    let order: &[(usize, usize, usize, usize)] = if tc {
+        &[
+            (128, 128, 2, 4),
+            (128, 64, 2, 2),
+            (64, 64, 2, 2),
+            (64, 32, 2, 1),
+            (32, 32, 1, 1),
+        ]
+    } else {
+        &[
+            (128, 128, 8, 8),
+            (128, 64, 8, 4),
+            (64, 64, 4, 4),
+            (64, 32, 4, 2),
+            (32, 32, 2, 2),
+        ]
+    };
+    let bk = if tc { 32 } else { 16 };
+    let mut last = None;
+    for &(bm, bn, tm, tn) in order {
         let p = MmParams {
             bm,
             bn,
-            bk: 16,
+            bk,
             tm,
             tn,
+            tc,
         };
+        last = Some(p);
         if tiles(&p) >= 2 * sms {
             return p;
         }
     }
-    MmParams {
-        bm: 32,
-        bn: 32,
-        bk: 16,
-        tm: 2,
-        tn: 2,
-    }
+    last.unwrap()
 }
 
 fn var(v: Var) -> String {
@@ -229,9 +290,13 @@ fn collect_args(exprs: &[&E], outs: &[usize]) -> (Vec<Arg>, HashMap<usize, usize
 /// The kernel signature (outputs writable, inputs read-only) and, for the
 /// emulator, an entry point `KNAME_emu` taking the arguments as an array.
 fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
-    let params: Vec<String> = (0..args.len())
-        .map(|i| {
-            if i < nout {
+    let params: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if matches!(a, Arg::PackedHalf { .. }) {
+                format!("const khalf *__restrict__ b{i}")
+            } else if i < nout {
                 format!("float *__restrict__ b{i}")
             } else {
                 format!("const float *__restrict__ b{i}")
@@ -241,8 +306,18 @@ fn signature(threads: usize, args: &[Arg], nout: usize) -> String {
     format!("KGLOBAL({threads}) KNAME({})", params.join(", "))
 }
 
-fn emu_entry(args: usize) -> String {
-    let call: Vec<String> = (0..args).map(|i| format!("A[{i}]")).collect();
+fn emu_entry(args: &[Arg]) -> String {
+    let call: Vec<String> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if matches!(a, Arg::PackedHalf { .. }) {
+                format!("(const khalf *)A[{i}]")
+            } else {
+                format!("A[{i}]")
+            }
+        })
+        .collect();
     format!(
         "#ifndef KILN_CUDA\nstatic void KNAME_body(float **A) {{ KNAME({}); }}\nextern \"C\" void KNAME_emu(float **A, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned smem) {{ kemu_launch(KNAME_body, A, gx, gy, gz, bx, 1, smem); }}\n#endif\n",
         call.join(", ")
@@ -359,7 +434,7 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
             }
         }
         s.push_str("}\n");
-        s.push_str(&emu_entry(args.len()));
+        s.push_str(&emu_entry(&args));
         return GpuKernel {
             src: s,
             args,
@@ -484,7 +559,7 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
         }
     }
     s.push_str("}\n");
-    s.push_str(&emu_entry(args.len()));
+    s.push_str(&emu_entry(&args));
     GpuKernel {
         src: s,
         args,
@@ -495,7 +570,10 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
 }
 
 pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
-    assert!(p.bm.is_multiple_of(p.tm) && p.bn.is_multiple_of(p.tn));
+    assert!(p.valid(), "invalid schedule {p:?}");
+    if p.tc {
+        return tc_matmul_kernel(mk, p);
+    }
     let mut exprs: Vec<&E> = vec![&mk.a, &mk.epi];
     exprs.extend(mk.lets.iter().map(|l| &l.1));
     if let BOp::Expr(e) = &mk.b {
@@ -516,7 +594,9 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         BOp::Expr(_) => None,
     };
     let (m, n, kk) = (mk.m, mk.n, mk.k);
-    let MmParams { bm, bn, bk, tm, tn } = p;
+    let MmParams {
+        bm, bn, bk, tm, tn, ..
+    } = p;
     let (sx, sy) = (bn / tn, bm / tm);
     let nt = sx * sy;
     let batch: usize = mk.batch.iter().map(|b| b.1).product();
@@ -613,12 +693,144 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         gx.e(&mk.epi)
     );
     s.push_str("      }\n    }\n}\n");
-    s.push_str(&emu_entry(args.len()));
+    s.push_str(&emu_entry(&args));
     GpuKernel {
         src: s,
         args,
         grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
         block: nt as u32,
         smem: ((bk * lda + bk * bn) * 4) as u32,
+    }
+}
+
+/// The matmul on tensor cores: operands converted to fp16 as they are
+/// staged into shared memory (constant weights are stored as fp16 already,
+/// transposed so that k is contiguous), products accumulated in fp32 by
+/// mma.m16n8k8. Both tiles keep k contiguous with rows padded to BK + 8
+/// halves, so the fragment loads of a warp hit 32 distinct banks.
+fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
+    let mut exprs: Vec<&E> = vec![&mk.a, &mk.epi];
+    exprs.extend(mk.lets.iter().map(|l| &l.1));
+    if let BOp::Expr(e) = &mk.b {
+        exprs.push(e);
+    }
+    let (mut args, map) = collect_args(&exprs, &[mk.out]);
+    let packed = match &mk.b {
+        BOp::Packed { value, lin } => {
+            args.push(Arg::PackedHalf {
+                value: *value,
+                lin: lin.clone(),
+                k: mk.k,
+                n: mk.n,
+            });
+            Some(args.len() - 1)
+        }
+        BOp::Expr(_) => None,
+    };
+    let (m, n, kk) = (mk.m, mk.n, mk.k);
+    let MmParams {
+        bm, bn, bk, tm, tn, ..
+    } = p;
+    let (wtm, wtn) = (bm / tm, bn / tn);
+    let (mt, nt) = (wtm / 16, wtn / 8);
+    let threads = p.threads();
+    let ldk = bk + 8;
+    let batch: usize = mk.batch.iter().map(|b| b.1).product();
+    let names: HashMap<Var, String> = [
+        (mk.vi, "_i".to_string()),
+        (mk.vj, "_j".to_string()),
+        (mk.vk, "_k".to_string()),
+    ]
+    .into();
+    let gx = Gx {
+        args: &map,
+        names,
+        acc: Some("acc".into()),
+        temps: true,
+    };
+    let mut s = String::new();
+    let _ = writeln!(s, "{} {{", signature(threads, &args, 1));
+    s.push_str("  SMEM;\n");
+    let _ = writeln!(
+        s,
+        "  khalf *As = (khalf *)kiln_smem, *Bs = As + {};",
+        bm * ldk
+    );
+    s.push_str("  const int tid = threadIdx.x, lane = tid % 32, warp = tid / 32, g = lane / 4, t4 = lane % 4;\n");
+    let _ = writeln!(s, "  const int wy = warp / {tn}, wx = warp % {tn};");
+    let _ = writeln!(
+        s,
+        "  const int m0 = blockIdx.y * {bm}, n0 = blockIdx.x * {bn}, tb = blockIdx.z;"
+    );
+    s.push_str(&decode(&mk.batch, "tb", "  "));
+    let _ = writeln!(s, "  float c[{mt}][{nt}][4];");
+    let _ = writeln!(
+        s,
+        "  #pragma unroll\n  for (int a = 0; a < {mt}; a++)\n    #pragma unroll\n    for (int b = 0; b < {nt}; b++)\n      #pragma unroll\n      for (int i = 0; i < 4; i++) c[a][b][i] = 0.0f;"
+    );
+    let _ = writeln!(s, "  for (int k0 = 0; k0 < {kk}; k0 += {bk}) {{");
+    let _ = writeln!(
+        s,
+        "    for (int e = tid; e < {}; e += {threads}) {{ const int kk = e % {bk}, ii = e / {bk}, _i = m0 + ii, _k = k0 + kk; As[ii * {ldk} + kk] = kf2h((_i < {m} && _k < {kk}) ? {} : 0.0f); }}",
+        bm * bk,
+        gx.e(&mk.a)
+    );
+    let bload = match (&mk.b, packed) {
+        (BOp::Packed { .. }, Some(a)) => format!("b{a}[_j * {kk} + _k]"),
+        (BOp::Expr(e), _) => format!("kf2h({})", gx.e(e)),
+        _ => unreachable!(),
+    };
+    let _ = writeln!(
+        s,
+        "    for (int e = tid; e < {}; e += {threads}) {{ const int kk = e % {bk}, jj = e / {bk}, _j = n0 + jj, _k = k0 + kk; Bs[jj * {ldk} + kk] = (_j < {n} && _k < {kk}) ? {bload} : (khalf)0; }}",
+        bn * bk
+    );
+    s.push_str("    KSYNC();\n");
+    let _ = writeln!(
+        s,
+        "    #pragma unroll\n    for (int ks = 0; ks < {bk}; ks += 8) {{"
+    );
+    let _ = writeln!(s, "      unsigned a[{mt}][2], b[{nt}];");
+    let _ = writeln!(
+        s,
+        "      #pragma unroll\n      for (int x = 0; x < {mt}; x++) {{ const int r = wy * {wtm} + x * 16 + g; a[x][0] = kld2(As + r * {ldk} + ks + 2 * t4); a[x][1] = kld2(As + (r + 8) * {ldk} + ks + 2 * t4); }}"
+    );
+    let _ = writeln!(
+        s,
+        "      #pragma unroll\n      for (int y = 0; y < {nt}; y++) b[y] = kld2(Bs + (wx * {wtn} + y * 8 + g) * {ldk} + ks + 2 * t4);"
+    );
+    let _ = writeln!(
+        s,
+        "      #pragma unroll\n      for (int x = 0; x < {mt}; x++)\n        #pragma unroll\n        for (int y = 0; y < {nt}; y++) kmma(c[x][y], a[x][0], a[x][1], b[y]);"
+    );
+    s.push_str("    }\n    KSYNC();\n  }\n");
+    let _ = writeln!(
+        s,
+        "  #pragma unroll\n  for (int x = 0; x < {mt}; x++)\n    #pragma unroll\n    for (int y = 0; y < {nt}; y++)\n      #pragma unroll\n      for (int i = 0; i < 4; i++) {{"
+    );
+    let _ = writeln!(
+        s,
+        "        const int _i = m0 + wy * {wtm} + x * 16 + g + (i >= 2 ? 8 : 0), _j = n0 + wx * {wtn} + y * 8 + 2 * t4 + (i & 1);"
+    );
+    let _ = writeln!(s, "        if (_i < {m} && _j < {n}) {{");
+    s.push_str("          const float acc = c[x][y][i];\n");
+    for (id, e) in &mk.lets {
+        let _ = writeln!(s, "          const float e{id} = {};", gx.e(e));
+    }
+    let _ = writeln!(
+        s,
+        "          b{}[{}] = {};",
+        map[&mk.out],
+        gx.lin(&mk.out_idx),
+        gx.e(&mk.epi)
+    );
+    s.push_str("        }\n      }\n}\n");
+    s.push_str(&emu_entry(&args));
+    GpuKernel {
+        src: s,
+        args,
+        grid: [n.div_ceil(bn) as u32, m.div_ceil(bm) as u32, batch as u32],
+        block: threads as u32,
+        smem: ((bm + bn) * ldk * 2) as u32,
     }
 }

@@ -17,13 +17,15 @@ K=./target/release/kiln
 # Tune once (results are cached per GPU model), so rounds measure steady state.
 for m in mlp bert llama; do
   $K run models/$m.onnx models/$m.ref --device cuda --tune --iters 1 > /dev/null
+  $K run models/$m.onnx models/$m.ref --device cuda --half --tune --iters 1 > /dev/null
 done
 iters() { case $1 in mlp) echo 200 ;; *) echo 50 ;; esac; }
-CONFIGS=${CONFIGS:-"kiln no-graphs no-tune no-fusion baselines"}
+CONFIGS=${CONFIGS:-"kiln half no-graphs no-tune no-fusion baselines"}
 run() {
   m=$1 c=$2 n=$(iters $1)
   case $c in
     kiln) $K run models/$m.onnx models/$m.ref --device cuda --iters $n --json $OUT/gpu_runs.jsonl --label kiln > /dev/null ;;
+    half) $K run models/$m.onnx models/$m.ref --device cuda --half --iters $n --json $OUT/gpu_runs.jsonl --label "kiln fp16" > /dev/null ;;
     baselines) (cd scripts && $PY bench_gpu.py ../models $m --iters $n --json ../$OUT/gpu_runs.jsonl) ;;
     *) $K run models/$m.onnx models/$m.ref --device cuda --iters $n --$c --json $OUT/gpu_runs.jsonl --label "kiln --$c" > /dev/null ;;
   esac

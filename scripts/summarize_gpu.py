@@ -19,24 +19,37 @@ for r in runs:
 models = ["mlp", "bert", "llama"]
 titles = {"mlp": "MLP (4 blocks, 64 x 512)", "bert": "BERT bge-small (8 x 128 tokens)",
           "llama": "SmolLM2-135M (128 tokens)"}
-engines = ["kiln", "kiln fp16", "torch.compile", "torch.compile (CUDA graphs)", "onnxruntime", "jax/xla", "pytorch"]
-engines = [e for e in engines if any((m, e) in times for m in models)]
 med = {k: statistics.median(v) for k, v in times.items()}
 
 print(f"GPU: {device}\n")
-print("| Model | " + " | ".join(engines) + " |")
-print("|---|" + "---|" * len(engines))
-for m in models:
-    have = [med[(m, e)] for e in engines if (m, e) in med]
-    if not have:
-        continue
-    best = min(have)
-    cells = []
-    for e in engines:
-        v = med.get((m, e))
-        cells.append("-" if v is None else (f"**{v:.2f} ms**" if v == best else f"{v:.2f} ms"))
-    print(f"| {titles[m]} | " + " | ".join(cells) + " |")
-print()
+
+
+def table(engines, title):
+    engines = [e for e in engines if any((m, e) in times for m in models)]
+    if not engines:
+        return
+    print(title + "\n")
+    print("| Model | " + " | ".join(engines) + " |")
+    print("|---|" + "---|" * len(engines))
+    for m in models:
+        have = [med[(m, e)] for e in engines if (m, e) in med]
+        if not have:
+            continue
+        best = min(have)
+        cells = []
+        for e in engines:
+            v = med.get((m, e))
+            cells.append("-" if v is None else (f"**{v:.2f} ms**" if v == best else f"{v:.2f} ms"))
+        print(f"| {titles[m]} | " + " | ".join(cells) + " |")
+    print()
+
+
+table(["kiln", "torch.compile", "torch.compile (CUDA graphs)", "onnxruntime", "jax/xla", "pytorch"],
+      "fp32, median latency")
+table(["kiln fp16", "torch.compile fp16", "pytorch fp16"],
+      "fp16 matmul operands, fp32 accumulation (kiln --half; torch.autocast), median latency")
+engines = [e for e in ["kiln", "kiln fp16", "torch.compile", "torch.compile (CUDA graphs)", "onnxruntime", "jax/xla",
+                       "pytorch", "torch.compile fp16", "pytorch fp16"] if any((m, e) in times for m in models)]
 print("Max |difference| from the PyTorch (CPU, fp32) reference:")
 for m in models:
     print(f"- {m}: " + ", ".join(f"{e} {diffs[(m, e)]:.1e}" for e in engines if (m, e) in diffs))

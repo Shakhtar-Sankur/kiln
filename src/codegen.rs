@@ -23,6 +23,14 @@ pub enum Arg {
         n: usize,
         nr: usize,
     },
+    /// A constant matmul operand as fp16, transposed: element (k, j) at
+    /// j·K + k (the GPU's tensor-core kernels).
+    PackedHalf {
+        value: usize,
+        lin: Lin,
+        k: usize,
+        n: usize,
+    },
 }
 
 pub struct KernelSrc {

@@ -53,6 +53,8 @@ step "first run, tuning and per-kernel profile"
 for m in mlp bert llama; do
   log "--- $m"
   $K run models/$m.onnx models/$m.ref --device cuda --tune --iters 20 --profile 2>&1 | tee -a "$REPORT"
+  log "--- $m fp16 tensor cores"
+  $K run models/$m.onnx models/$m.ref --device cuda --half --tune --iters 20 --profile 2>&1 | tee -a "$REPORT"
 done
 for m in mlp bert llama; do
   log "--- $m untuned defaults, no CUDA graphs"

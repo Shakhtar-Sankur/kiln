@@ -7,7 +7,10 @@ outputs there; a timing is one call plus waiting for the device, as for
 `kiln run --device cuda`.
 
 Usage: python scripts/bench_gpu.py MODELS_DIR NAME [--iters 50]
-       [--engines torch,compile,compile-graphs,ort,jax] [--json OUT]
+       [--engines torch,compile,compile-graphs,ort,jax,torch-fp16,compile-fp16] [--json OUT]
+
+The -fp16 engines run under torch.autocast(float16): matmuls with fp16
+operands and fp32 accumulation, as `kiln run --half`.
 """
 
 import argparse
@@ -41,7 +44,7 @@ def main():
     ap.add_argument("models")
     ap.add_argument("name")
     ap.add_argument("--iters", type=int, default=50)
-    ap.add_argument("--engines", default="torch,compile,compile-graphs,ort,jax")
+    ap.add_argument("--engines", default="torch,compile,compile-graphs,ort,jax,torch-fp16,compile-fp16")
     ap.add_argument("--json")
     a = ap.parse_args()
     ref = read_ref(os.path.join(a.models, a.name + ".ref"))
@@ -60,7 +63,7 @@ def main():
     dev_name = torch.cuda.get_device_name(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    if {"torch", "compile", "compile-graphs", "jax"} & set(engines):
+    if {"torch", "compile", "compile-graphs", "jax", "torch-fp16", "compile-fp16"} & set(engines):
         import baseline_models as bm
         model, args = bm.torch_model(a.name, feeds)
         model = model.cuda()
@@ -80,6 +83,16 @@ def main():
                 run = lambda: cm(*args)
                 run()
                 report("torch.compile (CUDA graphs)", run().cpu().numpy(), *timeit(run, sync, a.iters), dev_name)
+            for e, mode in (("torch-fp16", None), ("compile-fp16", "default")):
+                if e not in engines:
+                    continue
+                torch._dynamo.reset()
+                f = model if mode is None else torch.compile(model)
+                def run(f=f):
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        return f(*args)
+                label = "pytorch fp16" if mode is None else "torch.compile fp16"
+                report(label, run().float().cpu().numpy(), *timeit(run, sync, a.iters), dev_name)
         if "jax" in engines:
             import jax
             if jax.devices()[0].platform != "gpu":

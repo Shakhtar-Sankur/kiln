@@ -16,6 +16,31 @@
 #define KINF __int_as_float(0x7f800000)
 #define KNAN __int_as_float(0x7fffffff)
 KDEV float kshfl_xor(float v, int m) { return __shfl_xor_sync(0xffffffffu, v, m); }
+// fp16 as raw bits (NVRTC has no cuda_fp16.h without the toolkit's headers).
+typedef unsigned short khalf;
+KDEV khalf kf2h(float f) {
+  khalf h;
+  asm("cvt.rn.f16.f32 %0, %1;" : "=h"(h) : "f"(f));
+  return h;
+}
+KDEV float kh2f(khalf h) {
+  float f;
+  asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(h));
+  return f;
+}
+// Two consecutive halves as one 32-bit register (p 4-byte aligned).
+KDEV unsigned kld2(const khalf *p) { return *(const unsigned *)p; }
+// D = A B + D on tensor cores: A 16x8 (row), B 8x8 (col), f16 in, f32
+// accumulate. Fragments, with g = lane / 4 and t = lane % 4:
+//   a0 = A[g][2t..2t+1], a1 = A[g+8][2t..2t+1], b0 = B[2t..2t+1][g],
+//   c[0..1] = C[g][2t..2t+1], c[2..3] = C[g+8][2t..2t+1].
+KDEV void kmma(float *c, unsigned a0, unsigned a1, unsigned b0) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, "
+      "{%0,%1,%2,%3};\n"
+      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+      : "r"(a0), "r"(a1), "r"(b0));
+}
 #else
 #include <math.h>
 #include <pthread.h>
@@ -55,6 +80,76 @@ static inline float kshfl_xor(float v, int m) {
   float r = x[l ^ m];
   KWSYNC();
   return r;
+}
+typedef unsigned short khalf;
+// IEEE binary16, round to nearest even (as cvt.rn.f16.f32).
+static inline khalf kf2h(float f) {
+  uint32_t x;
+  memcpy(&x, &f, 4);
+  uint32_t sign = (x >> 16) & 0x8000, mant = x & 0x7fffff;
+  int32_t e = (int32_t)((x >> 23) & 0xff);
+  if (e == 0xff) return sign | 0x7c00 | (mant ? 0x200 : 0);
+  int32_t exp = e - 127 + 15;
+  if (exp >= 31) return sign | 0x7c00;
+  if (exp <= 0) {
+    if (exp < -10) return sign;
+    mant |= 0x800000;
+    uint32_t shift = 14 - exp, h = mant >> shift, rem = mant & ((1u << shift) - 1), half = 1u << (shift - 1);
+    if (rem > half || (rem == half && (h & 1))) h++;
+    return sign | h;
+  }
+  uint32_t h = ((uint32_t)exp << 10) | (mant >> 13), rem = mant & 0x1fff;
+  if (rem > 0x1000 || (rem == 0x1000 && (h & 1))) h++;
+  return sign | h;
+}
+static inline float kh2f(khalf h) {
+  uint32_t sign = (uint32_t)(h & 0x8000) << 16, exp = (h >> 10) & 0x1f, mant = h & 0x3ff, x;
+  if (exp == 0) {
+    if (mant == 0) {
+      x = sign;
+    } else {
+      int32_t e = 1;
+      while (!(mant & 0x400)) {
+        mant <<= 1;
+        e--;
+      }
+      x = sign | ((uint32_t)(e + 127 - 15) << 23) | ((mant & 0x3ff) << 13);
+    }
+  } else if (exp == 31) {
+    x = sign | 0x7f800000 | (mant << 13);
+  } else {
+    x = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float f;
+  memcpy(&f, &x, 4);
+  return f;
+}
+static inline unsigned kld2(const khalf *p) {
+  unsigned v;
+  memcpy(&v, p, 4);
+  return v;
+}
+// The warp's fragments meet in the exchange buffer; each lane computes its
+// four outputs from them, in the fragment layout of mma.m16n8k8.
+static inline void kmma(float *c, unsigned a0, unsigned a1, unsigned b0) {
+  unsigned *x = (unsigned *)kxch();
+  unsigned l = ktid % 32, g = l / 4, t = l % 4;
+  x[l * 3] = a0;
+  x[l * 3 + 1] = a1;
+  x[l * 3 + 2] = b0;
+  KWSYNC();
+  for (int i = 0; i < 4; i++) {
+    unsigned row = g + (i >= 2 ? 8 : 0), col = 2 * t + (i & 1);
+    float s = 0.0f;
+    for (unsigned k = 0; k < 8; k++) {
+      unsigned ra = x[((row % 8) * 4 + k / 2) * 3 + (row >= 8 ? 1 : 0)];
+      unsigned rb = x[(col * 4 + k / 2) * 3 + 2];
+      khalf ha = (khalf)(ra >> (16 * (k & 1))), hb = (khalf)(rb >> (16 * (k & 1)));
+      s += kh2f(ha) * kh2f(hb);
+    }
+    c[i] += s;
+  }
+  KWSYNC();
 }
 struct KStart {
   KTeam *t;

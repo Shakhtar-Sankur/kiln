@@ -5,10 +5,10 @@
 
 use super::codegen::{self, MmParams};
 use super::driver::{Cuda, Nvrtc};
-use super::{Device, compile_cubin};
+use super::{Device, compile_cubin, mm_key};
 use crate::codegen::Arg;
 use crate::fuse::{Kernel, MatmulK, Plan, Step};
-use crate::runtime::{matmul_signature, pack};
+use crate::runtime::{matmul_signature, pack, pack_half_t};
 use crate::tensor::numel;
 use std::collections::HashMap;
 
@@ -27,16 +27,27 @@ fn load() -> HashMap<String, MmParams> {
     };
     for line in s.lines() {
         let f: Vec<&str> = line.split_whitespace().collect();
-        if f.len() == 6
-            && let (Ok(bm), Ok(bn), Ok(bk), Ok(tm), Ok(tn)) = (
+        if f.len() == 7
+            && let (Ok(bm), Ok(bn), Ok(bk), Ok(tm), Ok(tn), Ok(tc)) = (
                 f[1].parse(),
                 f[2].parse(),
                 f[3].parse(),
                 f[4].parse(),
                 f[5].parse(),
+                f[6].parse(),
             )
         {
-            out.insert(f[0].to_string(), MmParams { bm, bn, bk, tm, tn });
+            out.insert(
+                f[0].to_string(),
+                MmParams {
+                    bm,
+                    bn,
+                    bk,
+                    tm,
+                    tn,
+                    tc,
+                },
+            );
         }
     }
     out
@@ -45,7 +56,7 @@ fn load() -> HashMap<String, MmParams> {
 fn save(all: &HashMap<String, MmParams>) {
     let mut lines: Vec<String> = all
         .iter()
-        .map(|(k, p)| format!("{k} {} {} {} {} {}", p.bm, p.bn, p.bk, p.tm, p.tn))
+        .map(|(k, p)| format!("{k} {} {} {} {} {} {}", p.bm, p.bn, p.bk, p.tm, p.tn, p.tc))
         .collect();
     lines.sort();
     let _ = std::fs::create_dir_all(crate::jit::cache_dir());
@@ -64,7 +75,7 @@ fn matmuls(plan: &Plan) -> Vec<&MatmulK> {
 }
 
 /// Cached schedules for this plan's matmuls on the current GPU.
-pub fn cached(plan: &Plan, device: Device) -> HashMap<String, MmParams> {
+pub fn cached(plan: &Plan, device: Device, half: bool) -> HashMap<String, MmParams> {
     if device != Device::Cuda {
         return HashMap::new();
     }
@@ -74,7 +85,7 @@ pub fn cached(plan: &Plan, device: Device) -> HashMap<String, MmParams> {
     let all = load();
     let mut out = HashMap::new();
     for mk in matmuls(plan) {
-        let sig = matmul_signature(mk);
+        let sig = mm_key(mk, half);
         if let Some(p) = all.get(&key(&c.name, &sig)) {
             out.insert(sig, *p);
         }
@@ -83,7 +94,12 @@ pub fn cached(plan: &Plan, device: Device) -> HashMap<String, MmParams> {
 }
 
 /// Times every schedule of each matmul not yet tuned on this GPU.
-pub fn tune(plan: &Plan, device: Device, log: bool) -> Result<HashMap<String, MmParams>, String> {
+pub fn tune(
+    plan: &Plan,
+    device: Device,
+    half: bool,
+    log: bool,
+) -> Result<HashMap<String, MmParams>, String> {
     if device != Device::Cuda {
         return Ok(HashMap::new());
     }
@@ -94,14 +110,14 @@ pub fn tune(plan: &Plan, device: Device, log: bool) -> Result<HashMap<String, Mm
     let mut out = HashMap::new();
     let g = &plan.g;
     for mk in matmuls(plan) {
-        let sig = matmul_signature(mk);
+        let sig = mm_key(mk, half);
         let k = key(&c.name, &sig);
         if let Some(p) = all.get(&k) {
             out.insert(sig, *p);
             continue;
         }
         let t0 = std::time::Instant::now();
-        let space = codegen::mm_space();
+        let space = codegen::mm_space(half);
         let mut src = String::from(codegen::PRELUDE);
         let mut kernels = Vec::new();
         for (i, p) in space.iter().enumerate() {
@@ -140,6 +156,25 @@ pub fn tune(plan: &Plan, device: Device, log: bool) -> Result<HashMap<String, Mm
                     let data = pack(g.konst(*value).unwrap(), lin, *kk, *n, *nr, mk.vk, mk.vj);
                     let p = c.alloc(data.len() * 4)?;
                     c.upload(p, &data)?;
+                    p
+                }
+                Arg::PackedHalf {
+                    value,
+                    lin,
+                    k: kk,
+                    n,
+                } => {
+                    let h = pack_half_t(g.konst(*value).unwrap(), lin, *kk, *n, mk.vk, mk.vj);
+                    let words: Vec<f32> = h
+                        .chunks(2)
+                        .map(|c| {
+                            f32::from_bits(
+                                u32::from(c[0]) | (u32::from(*c.get(1).unwrap_or(&0)) << 16),
+                            )
+                        })
+                        .collect();
+                    let p = c.alloc(words.len() * 4)?;
+                    c.upload(p, &words)?;
                     p
                 }
             });

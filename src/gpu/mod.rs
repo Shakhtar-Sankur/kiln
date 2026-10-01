@@ -14,7 +14,7 @@ use crate::codegen::Arg;
 use crate::fuse::{Kernel, Plan, Step};
 use crate::interp;
 use crate::jit::{self, Library};
-use crate::runtime::{arena_layout, matmul_signature, pack};
+use crate::runtime::{arena_layout, matmul_signature, pack, pack_half_t};
 use crate::tensor::{DType, Tensor, numel};
 use codegen::{GpuKernel, MmParams};
 use driver::{Cuda, DevPtr, Function, GraphExec, Nvrtc};
@@ -36,6 +36,15 @@ pub struct GpuOptions {
     pub tpr: Option<usize>,
     /// Record kernel launches into CUDA graphs.
     pub graphs: bool,
+    /// Matmuls on fp16 tensor cores (fp32 accumulation; everything else
+    /// stays fp32).
+    pub half: bool,
+}
+
+/// The schedule table key of a matmul: its signature, and the precision.
+pub fn mm_key(mk: &crate::fuse::MatmulK, half: bool) -> String {
+    let s = matmul_signature(mk);
+    if half { format!("{s}_f16") } else { s }
 }
 
 impl GpuOptions {
@@ -45,6 +54,7 @@ impl GpuOptions {
             mm: HashMap::new(),
             tpr: None,
             graphs: true,
+            half: false,
         }
     }
 }
@@ -116,6 +126,19 @@ impl Dev {
         Ok(p)
     }
 
+    fn upload_half(&mut self, data: &[u16]) -> Result<DevPtr, String> {
+        let mut words = vec![0f32; data.len().div_ceil(2)];
+        // SAFETY: words has room for every half (two per f32).
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr() as *const u8,
+                words.as_mut_ptr() as *mut u8,
+                data.len() * 2,
+            )
+        };
+        self.upload(&words)
+    }
+
     fn h2d(&self, dst: DevPtr, src: &[f32]) -> Result<(), String> {
         match self {
             Dev::Cuda(c) => c.h2d_async(dst, src.as_ptr(), src.len()),
@@ -169,9 +192,10 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
                 Kernel::Matmul(mk) => {
                     let p = opts
                         .mm
-                        .get(&matmul_signature(mk))
+                        .get(&mm_key(mk, opts.half))
                         .copied()
-                        .unwrap_or_else(|| codegen::default_mm(mk, sms));
+                        .filter(|p| p.tc == opts.half)
+                        .unwrap_or_else(|| codegen::default_mm(mk, sms, opts.half));
                     codegen::matmul_kernel(mk, p)
                 }
             });
@@ -250,6 +274,11 @@ impl GpuExecutable {
             Dev::Cuda(c) => (c.sms, format!("{} (sm_{}{})", c.name, c.cc.0, c.cc.1)),
             Dev::Emu(_) => (40, "emulator".into()),
         };
+        let devname = if opts.half {
+            format!("{devname}, fp16 tensor cores")
+        } else {
+            devname
+        };
         let gn = generate(&plan, opts, sms);
         let (funcs, cached) = match &dev {
             Dev::Cuda(c) => {
@@ -287,6 +316,7 @@ impl GpuExecutable {
         let g = &plan.g;
         let mut consts: HashMap<usize, DevPtr> = HashMap::new();
         let mut packed: HashMap<(usize, crate::ir::Lin), DevPtr> = HashMap::new();
+        let mut packed_half: HashMap<(usize, crate::ir::Lin), DevPtr> = HashMap::new();
         let mut steps = Vec::new();
         let mut kernel_steps = gn.kernels.iter().zip(&gn.names);
         let mut host = 0;
@@ -316,6 +346,34 @@ impl GpuExecutable {
                                         format!("value {} has no buffer", g.values[*v].name)
                                     })?;
                                     arena + 4 * off as DevPtr
+                                }
+                            }
+                            Arg::PackedHalf {
+                                value,
+                                lin,
+                                k: kk,
+                                n,
+                            } => {
+                                let key = (*value, lin.clone());
+                                match packed_half.get(&key) {
+                                    Some(&p) => p,
+                                    None => {
+                                        let (vk, vj) = match k {
+                                            Kernel::Matmul(mk) => (mk.vk, mk.vj),
+                                            Kernel::Loop(_) => unreachable!(),
+                                        };
+                                        let data = pack_half_t(
+                                            g.konst(*value).unwrap(),
+                                            lin,
+                                            *kk,
+                                            *n,
+                                            vk,
+                                            vj,
+                                        );
+                                        let p = dev.upload_half(&data)?;
+                                        packed_half.insert(key, p);
+                                        p
+                                    }
                                 }
                             }
                             Arg::Packed {

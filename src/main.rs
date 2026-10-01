@@ -14,12 +14,13 @@ USAGE:
   kiln cuda-check MODEL.onnx REF.ref [--arch 75] [--save FILE.cu]
                                      compile the CUDA kernels with NVRTC (no GPU needed)
   kiln run MODEL.onnx REF.ref [--device cpu|cuda|emu] [--threads N] [--iters N]
-                                     [--tune | --no-tune] [--profile] [--no-graphs]
+                                     [--tune | --no-tune] [--profile] [--no-graphs] [--half]
                                      [--json FILE --label NAME]
                                      [--no-epilogue] [--no-rows] [--no-inline] [--no-fold] [--no-fusion]
                                      compile to native kernels, run, compare, time
                                      (--device cuda: CUDA kernels on the first GPU;
-                                     emu: the same kernels on kiln's CPU emulator of CUDA)
+                                     emu: the same kernels on kiln's CPU emulator of CUDA;
+                                     --half: matmuls on fp16 tensor cores)
                                      (--tune searches matmul schedules; results are cached;
                                      --no-* switch off one optimization, for ablations)
 ";
@@ -367,11 +368,12 @@ fn run_gpu(
     let has = |f: &str| args.iter().any(|a| a == f);
     let mut opts = GpuOptions::new(device);
     opts.graphs = !has("--no-graphs");
+    opts.half = has("--half");
     if !has("--no-tune") {
-        opts.mm = kiln::gpu::tune::cached(&plan, device);
+        opts.mm = kiln::gpu::tune::cached(&plan, device, opts.half);
     }
     if has("--tune") {
-        opts.mm = kiln::gpu::tune::tune(&plan, device, true).unwrap_or_else(|e| die(&e));
+        opts.mm = kiln::gpu::tune::tune(&plan, device, opts.half, true).unwrap_or_else(|e| die(&e));
     }
     let mut ex = GpuExecutable::build(plan, &opts).unwrap_or_else(|e| die(&e));
     let compile_s = t.elapsed().as_secs_f64();

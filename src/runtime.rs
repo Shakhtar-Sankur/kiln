@@ -177,6 +177,61 @@ pub fn arena_layout(plan: &Plan, kernel_args: &[&[Arg]]) -> (HashMap<usize, usiz
     (offsets, total, naive)
 }
 
+/// A constant matmul operand as fp16 (round to nearest even), transposed:
+/// element (k, j) at j·K + k.
+pub fn pack_half_t(
+    t: &Tensor,
+    lin: &crate::ir::Lin,
+    k: usize,
+    n: usize,
+    vk: u32,
+    vj: u32,
+) -> Vec<u16> {
+    let rows = pack(t, lin, k, n, n, vk, vj); // [k][n]
+    let mut out = vec![0u16; n * k];
+    for kk in 0..k {
+        for j in 0..n {
+            out[j * k + kk] = f32_to_f16(rows[kk * n + j]);
+        }
+    }
+    out
+}
+
+/// IEEE binary16 bits of `f`, rounded to nearest even.
+pub fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let mant = x & 0x7f_ffff;
+    let e = ((x >> 23) & 0xff) as i32;
+    if e == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let exp = e - 127 + 15;
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign;
+        }
+        let m = mant | 0x80_0000;
+        let shift = (14 - exp) as u32;
+        let mut h = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        if rem > half || (rem == half && h & 1 == 1) {
+            h += 1;
+        }
+        return sign | h as u16;
+    }
+    let mut h = ((exp as u32) << 10) | (mant >> 13);
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && h & 1 == 1) {
+        h += 1;
+    }
+    sign | h as u16
+}
+
 /// Packs a constant matmul operand into panels of width `nr`: panel p
 /// holds rows k = 0..K of columns p·nr..(p+1)·nr, zero-padded.
 pub fn pack(
@@ -317,6 +372,9 @@ impl Executable {
                                     packed.len() - 1
                                 });
                                 packed[id].as_ptr() as *mut f32
+                            }
+                            Arg::PackedHalf { .. } => {
+                                return Err("an fp16 operand in a CPU kernel".into());
                             }
                         };
                         args.push(ptr);
