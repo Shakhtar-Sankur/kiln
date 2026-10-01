@@ -25,6 +25,19 @@ use std::fmt::Write;
 
 pub const PRELUDE: &str = include_str!("prelude.cuh");
 
+/// Rows of a constant table selected by indices uploaded at run time
+/// (embedding lookups): out[i][c] = table[idx[i]][c].
+pub const GATHER: &str = r#"
+KGLOBAL(256) kgather(float *__restrict__ out, const float *__restrict__ table, const int *__restrict__ idx, int n, int row) {
+  const int e = blockIdx.x * 256 + threadIdx.x;
+  if (e < n * row) out[e] = table[idx[e / row] * row + e % row];
+}
+#ifndef KILN_CUDA
+static void kgather_body(float **A) { kgather(A[0], A[1], (const int *)A[2], (int)(intptr_t)A[3], (int)(intptr_t)A[4]); }
+extern "C" void kgather_emu(float **A, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned smem) { kemu_launch(kgather_body, A, gx, gy, gz, bx, 1, smem); }
+#endif
+"#;
+
 /// A generated kernel. `src` names the function `KNAME`; kernels with
 /// identical source share one function.
 #[derive(Clone, Debug)]
@@ -569,11 +582,155 @@ pub fn loop_kernel(k: &LoopK, tpr: Option<usize>) -> GpuKernel {
     }
 }
 
-pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
-    assert!(p.valid(), "invalid schedule {p:?}");
-    if p.tc {
-        return tc_matmul_kernel(mk, p);
+/// How one operand tile moves from global to shared memory: element by
+/// element, or 16 bytes at a time along k or along the tile's rows.
+enum Load {
+    Scalar(String),
+    VecK(String),
+    VecR(String),
+    /// Eight fp16 values along k (constant weights stored as fp16).
+    Half8K(String),
+}
+
+/// An operand tile of `rows` x `bk`, loaded into registers by every thread
+/// (`nt` threads) a tile ahead and stored into shared memory after the
+/// previous tile's products, so global loads overlap the arithmetic.
+struct Tile<'a> {
+    name: &'a str,
+    rows: usize,
+    bk: usize,
+    r0: &'a str,
+    rvar: &'a str,
+    rlim: usize,
+    klim: usize,
+    load: Load,
+    nt: usize,
+}
+
+impl Tile<'_> {
+    fn width(&self) -> usize {
+        match self.load {
+            Load::Scalar(_) => 1,
+            Load::VecK(_) | Load::VecR(_) => 4,
+            Load::Half8K(_) => 8,
+        }
     }
+
+    fn chunks(&self) -> usize {
+        self.rows * self.bk / self.width()
+    }
+
+    fn count(&self) -> usize {
+        self.chunks().div_ceil(self.nt)
+    }
+
+    fn decl(&self) -> String {
+        let t = match self.load {
+            Load::Scalar(_) => "float",
+            Load::VecK(_) | Load::VecR(_) => "kf4",
+            Load::Half8K(_) => "kh8",
+        };
+        format!("  {t} {}r[{}];\n", self.name, self.count())
+    }
+
+    fn coords(&self) -> String {
+        let bk = self.bk;
+        match self.load {
+            Load::Scalar(_) => format!("const int kk = c % {bk}, rr = c / {bk};"),
+            Load::VecK(_) => format!("const int kk = (c % {}) * 4, rr = c / {};", bk / 4, bk / 4),
+            Load::Half8K(_) => format!("const int kk = (c % {}) * 8, rr = c / {};", bk / 8, bk / 8),
+            Load::VecR(_) => format!(
+                "const int rr = (c % {}) * 4, kk = c / {};",
+                self.rows / 4,
+                self.rows / 4
+            ),
+        }
+    }
+
+    /// Loads the tile at k offset `kn` into the registers.
+    fn load_code(&self) -> String {
+        let (val, zero) = match &self.load {
+            Load::Scalar(e) => (e.clone(), "0.0f"),
+            Load::VecK(p) | Load::VecR(p) => (format!("kld4({p})"), "kz4()"),
+            Load::Half8K(p) => (format!("kld8h({p})"), "kz8h()"),
+        };
+        format!(
+            "    #pragma unroll\n    for (int q = 0; q < {}; q++) {{ const int c = tid + q * {}; {} const int {} = {} + rr, _k = kn + kk; {}r[q] = (c < {} && {} < {} && _k < {}) ? {val} : {zero}; }}\n",
+            self.count(),
+            self.nt,
+            self.coords(),
+            self.rvar,
+            self.r0,
+            self.name,
+            self.chunks(),
+            self.rvar,
+            self.rlim,
+            self.klim
+        )
+    }
+
+    /// Stores the registers into shared memory: `st(row, k, value)` stores
+    /// one f32; `vec` (if given) stores a whole vector at (rr, kk).
+    fn store_code(
+        &self,
+        st: &dyn Fn(&str, &str, &str) -> String,
+        vec: Option<&dyn Fn(&str) -> String>,
+    ) -> String {
+        let n = self.name;
+        let body = match (&self.load, vec) {
+            (Load::Scalar(_), _) => st("rr", "kk", &format!("{n}r[q]")),
+            (Load::VecK(_) | Load::Half8K(_), Some(v)) => v(&format!("{n}r[q]")),
+            (Load::VecK(_), None) => ["x", "y", "z", "w"]
+                .iter()
+                .enumerate()
+                .map(|(u, f)| st("rr", &format!("kk + {u}"), &format!("{n}r[q].{f}")))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (Load::VecR(_), _) => ["x", "y", "z", "w"]
+                .iter()
+                .enumerate()
+                .map(|(u, f)| st(&format!("rr + {u}"), "kk", &format!("{n}r[q].{f}")))
+                .collect::<Vec<_>>()
+                .join(" "),
+            (Load::Half8K(_), None) => unreachable!(),
+        };
+        format!(
+            "    #pragma unroll\n    for (int q = 0; q < {}; q++) {{ const int c = tid + q * {}; if (c < {}) {{ {} {body} }} }}\n",
+            self.count(),
+            self.nt,
+            self.chunks(),
+            self.coords()
+        )
+    }
+}
+
+/// A pure load whose index has unit stride along `along`, with the base
+/// and every other term multiples of 4: when `along` is a multiple of 4,
+/// four consecutive elements are contiguous and 16-byte aligned (buffers
+/// are 64-byte aligned).
+fn vec4_index(e: &E, along: Var) -> Option<(&Buf, &Lin)> {
+    let E::Load(b, l) = e else { return None };
+    if !matches!(b, Buf::Value(_)) || l.coeff(along) != (1, false) || l.c % 4 != 0 {
+        return None;
+    }
+    for (a, k) in &l.terms {
+        match a {
+            crate::ir::Atom::Var(x) if *x == along => {}
+            _ if k % 4 != 0 => return None,
+            _ => {}
+        }
+    }
+    Some((b, l))
+}
+
+struct MmCommon {
+    args: Vec<Arg>,
+    map: HashMap<usize, usize>,
+    packed: Option<usize>,
+    batch: usize,
+}
+
+fn mm_common(mk: &MatmulK, half: bool) -> MmCommon {
     let mut exprs: Vec<&E> = vec![&mk.a, &mk.epi];
     exprs.extend(mk.lets.iter().map(|l| &l.1));
     if let BOp::Expr(e) = &mk.b {
@@ -582,37 +739,126 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     let (mut args, map) = collect_args(&exprs, &[mk.out]);
     let packed = match &mk.b {
         BOp::Packed { value, lin } => {
-            args.push(Arg::Packed {
-                value: *value,
-                lin: lin.clone(),
-                k: mk.k,
-                n: mk.n,
-                nr: mk.n,
+            args.push(if half {
+                Arg::PackedHalf {
+                    value: *value,
+                    lin: lin.clone(),
+                    k: mk.k,
+                    n: mk.n,
+                }
+            } else {
+                Arg::Packed {
+                    value: *value,
+                    lin: lin.clone(),
+                    k: mk.k,
+                    n: mk.n,
+                    nr: mk.n,
+                }
             });
             Some(args.len() - 1)
         }
         BOp::Expr(_) => None,
     };
+    MmCommon {
+        args,
+        map,
+        packed,
+        batch: mk.batch.iter().map(|b| b.1).product(),
+    }
+}
+
+fn mm_names(mk: &MatmulK) -> HashMap<Var, String> {
+    [
+        (mk.vi, "_i".to_string()),
+        (mk.vj, "_j".to_string()),
+        (mk.vk, "_k".to_string()),
+    ]
+    .into()
+}
+
+/// The A tile (BM x BK): 4-wide along k when A is contiguous in k.
+fn a_tile<'a>(mk: &MatmulK, gx: &Gx, bm: usize, bk: usize, nt: usize) -> Tile<'a> {
+    let load = match vec4_index(&mk.a, mk.vk) {
+        Some((b, l)) if mk.k % 4 == 0 && bk % 4 == 0 => {
+            Load::VecK(format!("{} + ({})", gx.buf(b), gx.lin(l)))
+        }
+        _ => Load::Scalar(gx.e(&mk.a)),
+    };
+    Tile {
+        name: "ta",
+        rows: bm,
+        bk,
+        r0: "m0",
+        rvar: "_i",
+        rlim: mk.m,
+        klim: mk.k,
+        load,
+        nt,
+    }
+}
+
+/// Epilogue: the fused elementwise root on accumulator `acc` at (_i, _j).
+fn epilogue(mk: &MatmulK, gx: &Gx, map: &HashMap<usize, usize>, indent: &str) -> String {
+    let mut s = String::new();
+    for (id, e) in &mk.lets {
+        let _ = writeln!(s, "{indent}const float e{id} = {};", gx.e(e));
+    }
+    let _ = writeln!(
+        s,
+        "{indent}b{}[{}] = {};",
+        map[&mk.out],
+        gx.lin(&mk.out_idx),
+        gx.e(&mk.epi)
+    );
+    s
+}
+
+pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
+    assert!(p.valid(), "invalid schedule {p:?}");
+    if p.tc {
+        return tc_matmul_kernel(mk, p);
+    }
+    let MmCommon {
+        args,
+        map,
+        packed,
+        batch,
+    } = mm_common(mk, false);
     let (m, n, kk) = (mk.m, mk.n, mk.k);
     let MmParams {
         bm, bn, bk, tm, tn, ..
     } = p;
     let (sx, sy) = (bn / tn, bm / tm);
     let nt = sx * sy;
-    let batch: usize = mk.batch.iter().map(|b| b.1).product();
-    let names: HashMap<Var, String> = [
-        (mk.vi, "_i".to_string()),
-        (mk.vj, "_j".to_string()),
-        (mk.vk, "_k".to_string()),
-    ]
-    .into();
     let gx = Gx {
         args: &map,
-        names,
+        names: mm_names(mk),
         acc: Some("acc".into()),
         temps: true,
     };
     let lda = bm + 1;
+    let ta = a_tile(mk, &gx, bm, bk, nt);
+    // B tile (BK x BN), 4-wide along j when contiguous in j.
+    let bload = match (&mk.b, packed) {
+        (BOp::Packed { .. }, Some(a)) if n % 4 == 0 => Load::VecR(format!("b{a} + _k * {n} + _j")),
+        (BOp::Packed { .. }, Some(a)) => Load::Scalar(format!("b{a}[_k * {n} + _j]")),
+        (BOp::Expr(e), _) => match vec4_index(e, mk.vj) {
+            Some((b, l)) if n % 4 == 0 => Load::VecR(format!("{} + ({})", gx.buf(b), gx.lin(l))),
+            _ => Load::Scalar(gx.e(e)),
+        },
+        _ => unreachable!(),
+    };
+    let tb = Tile {
+        name: "tb",
+        rows: bn,
+        bk,
+        r0: "n0",
+        rvar: "_j",
+        rlim: n,
+        klim: kk,
+        load: bload,
+        nt,
+    };
     let mut s = String::new();
     let _ = writeln!(s, "{} {{", signature(nt, &args, 1));
     s.push_str("  SMEM;\n");
@@ -635,25 +881,23 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         s,
         "  #pragma unroll\n  for (int r = 0; r < {tm}; r++)\n    #pragma unroll\n    for (int q = 0; q < {tn}; q++) c[r][q] = 0.0f;"
     );
+    s.push_str(&ta.decl());
+    s.push_str(&tb.decl());
+    s.push_str("  {\n    const int kn = 0;\n");
+    s.push_str(&ta.load_code());
+    s.push_str(&tb.load_code());
+    s.push_str("  }\n");
     let _ = writeln!(s, "  for (int k0 = 0; k0 < {kk}; k0 += {bk}) {{");
-    // Stage A (BM x BK, k fastest for coalescing) and B (BK x BN).
-    let _ = writeln!(
-        s,
-        "    for (int e = tid; e < {}; e += {nt}) {{ const int kk = e % {bk}, ii = e / {bk}, _i = m0 + ii, _k = k0 + kk; As[kk * {lda} + ii] = (_i < {m} && _k < {kk}) ? {} : 0.0f; }}",
-        bm * bk,
-        gx.e(&mk.a)
-    );
-    let bload = match (&mk.b, packed) {
-        (BOp::Packed { .. }, Some(a)) => format!("b{a}[_k * {n} + _j]"),
-        (BOp::Expr(e), _) => gx.e(e),
-        _ => unreachable!(),
-    };
-    let _ = writeln!(
-        s,
-        "    for (int e = tid; e < {}; e += {nt}) {{ const int jj = e % {bn}, kk = e / {bn}, _j = n0 + jj, _k = k0 + kk; Bs[kk * {bn} + jj] = (_j < {n} && _k < {kk}) ? {bload} : 0.0f; }}",
-        bn * bk
-    );
+    s.push_str(&ta.store_code(&|r, k, v| format!("As[({k}) * {lda} + {r}] = {v};"), None));
+    s.push_str(&tb.store_code(&|r, k, v| format!("Bs[({k}) * {bn} + {r}] = {v};"), None));
     s.push_str("    KSYNC();\n");
+    let _ = writeln!(
+        s,
+        "    if (k0 + {bk} < {kk}) {{\n    const int kn = k0 + {bk};"
+    );
+    s.push_str(&ta.load_code());
+    s.push_str(&tb.load_code());
+    s.push_str("    }\n");
     let _ = writeln!(
         s,
         "    #pragma unroll\n    for (int kk = 0; kk < {bk}; kk++) {{"
@@ -682,16 +926,7 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     let _ = writeln!(s, "      if (_i < {m} && _j < {n}) {{");
     s.push_str("        const float acc = c[r][q];\n");
-    for (id, e) in &mk.lets {
-        let _ = writeln!(s, "        const float e{id} = {};", gx.e(e));
-    }
-    let _ = writeln!(
-        s,
-        "        b{}[{}] = {};",
-        map[&mk.out],
-        gx.lin(&mk.out_idx),
-        gx.e(&mk.epi)
-    );
+    s.push_str(&epilogue(mk, &gx, &map, "        "));
     s.push_str("      }\n    }\n}\n");
     s.push_str(&emu_entry(&args));
     GpuKernel {
@@ -709,24 +944,12 @@ pub fn matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
 /// mma.m16n8k8. Both tiles keep k contiguous with rows padded to BK + 8
 /// halves, so the fragment loads of a warp hit 32 distinct banks.
 fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
-    let mut exprs: Vec<&E> = vec![&mk.a, &mk.epi];
-    exprs.extend(mk.lets.iter().map(|l| &l.1));
-    if let BOp::Expr(e) = &mk.b {
-        exprs.push(e);
-    }
-    let (mut args, map) = collect_args(&exprs, &[mk.out]);
-    let packed = match &mk.b {
-        BOp::Packed { value, lin } => {
-            args.push(Arg::PackedHalf {
-                value: *value,
-                lin: lin.clone(),
-                k: mk.k,
-                n: mk.n,
-            });
-            Some(args.len() - 1)
-        }
-        BOp::Expr(_) => None,
-    };
+    let MmCommon {
+        args,
+        map,
+        packed,
+        batch,
+    } = mm_common(mk, true);
     let (m, n, kk) = (mk.m, mk.n, mk.k);
     let MmParams {
         bm, bn, bk, tm, tn, ..
@@ -735,18 +958,41 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     let (mt, nt) = (wtm / 16, wtn / 8);
     let threads = p.threads();
     let ldk = bk + 8;
-    let batch: usize = mk.batch.iter().map(|b| b.1).product();
-    let names: HashMap<Var, String> = [
-        (mk.vi, "_i".to_string()),
-        (mk.vj, "_j".to_string()),
-        (mk.vk, "_k".to_string()),
-    ]
-    .into();
     let gx = Gx {
         args: &map,
-        names,
+        names: mm_names(mk),
         acc: Some("acc".into()),
         temps: true,
+    };
+    let ta = a_tile(mk, &gx, bm, bk, threads);
+    // B tile, stored n-major (BN x BK): 8 halves along k for fp16
+    // weights, 4 floats along k or along j for activations.
+    let bload = match (&mk.b, packed) {
+        (BOp::Packed { .. }, Some(a)) if kk % 8 == 0 => {
+            Load::Half8K(format!("b{a} + _j * {kk} + _k"))
+        }
+        (BOp::Packed { .. }, Some(a)) => Load::Scalar(format!("kh2f(b{a}[_j * {kk} + _k])")),
+        (BOp::Expr(e), _) => match (vec4_index(e, mk.vk), vec4_index(e, mk.vj)) {
+            (Some((b, l)), _) if kk % 4 == 0 => {
+                Load::VecK(format!("{} + ({})", gx.buf(b), gx.lin(l)))
+            }
+            (_, Some((b, l))) if n % 4 == 0 => {
+                Load::VecR(format!("{} + ({})", gx.buf(b), gx.lin(l)))
+            }
+            _ => Load::Scalar(gx.e(e)),
+        },
+        _ => unreachable!(),
+    };
+    let tb = Tile {
+        name: "tb",
+        rows: bn,
+        bk,
+        r0: "n0",
+        rvar: "_j",
+        rlim: n,
+        klim: kk,
+        load: bload,
+        nt: threads,
     };
     let mut s = String::new();
     let _ = writeln!(s, "{} {{", signature(threads, &args, 1));
@@ -768,24 +1014,30 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
         s,
         "  #pragma unroll\n  for (int a = 0; a < {mt}; a++)\n    #pragma unroll\n    for (int b = 0; b < {nt}; b++)\n      #pragma unroll\n      for (int i = 0; i < 4; i++) c[a][b][i] = 0.0f;"
     );
+    s.push_str(&ta.decl());
+    s.push_str(&tb.decl());
+    s.push_str("  {\n    const int kn = 0;\n");
+    s.push_str(&ta.load_code());
+    s.push_str(&tb.load_code());
+    s.push_str("  }\n");
     let _ = writeln!(s, "  for (int k0 = 0; k0 < {kk}; k0 += {bk}) {{");
-    let _ = writeln!(
-        s,
-        "    for (int e = tid; e < {}; e += {threads}) {{ const int kk = e % {bk}, ii = e / {bk}, _i = m0 + ii, _k = k0 + kk; As[ii * {ldk} + kk] = kf2h((_i < {m} && _k < {kk}) ? {} : 0.0f); }}",
-        bm * bk,
-        gx.e(&mk.a)
-    );
-    let bload = match (&mk.b, packed) {
-        (BOp::Packed { .. }, Some(a)) => format!("b{a}[_j * {kk} + _k]"),
-        (BOp::Expr(e), _) => format!("kf2h({})", gx.e(e)),
-        _ => unreachable!(),
+    let ast = |r: &str, k: &str, v: &str| format!("As[({r}) * {ldk} + {k}] = kf2h({v});");
+    let avec = |v: &str| format!("kst4h(As + rr * {ldk} + kk, {v});");
+    s.push_str(&ta.store_code(&ast, Some(&avec)));
+    let bst = |r: &str, k: &str, v: &str| format!("Bs[({r}) * {ldk} + {k}] = kf2h({v});");
+    let bvec: Box<dyn Fn(&str) -> String> = match tb.load {
+        Load::Half8K(_) => Box::new(move |v: &str| format!("kst8h(Bs + rr * {ldk} + kk, {v});")),
+        _ => Box::new(move |v: &str| format!("kst4h(Bs + rr * {ldk} + kk, {v});")),
     };
+    s.push_str(&tb.store_code(&bst, Some(&*bvec)));
+    s.push_str("    KSYNC();\n");
     let _ = writeln!(
         s,
-        "    for (int e = tid; e < {}; e += {threads}) {{ const int kk = e % {bk}, jj = e / {bk}, _j = n0 + jj, _k = k0 + kk; Bs[jj * {ldk} + kk] = (_j < {n} && _k < {kk}) ? {bload} : (khalf)0; }}",
-        bn * bk
+        "    if (k0 + {bk} < {kk}) {{\n    const int kn = k0 + {bk};"
     );
-    s.push_str("    KSYNC();\n");
+    s.push_str(&ta.load_code());
+    s.push_str(&tb.load_code());
+    s.push_str("    }\n");
     let _ = writeln!(
         s,
         "    #pragma unroll\n    for (int ks = 0; ks < {bk}; ks += 8) {{"
@@ -814,16 +1066,7 @@ fn tc_matmul_kernel(mk: &MatmulK, p: MmParams) -> GpuKernel {
     );
     let _ = writeln!(s, "        if (_i < {m} && _j < {n}) {{");
     s.push_str("          const float acc = c[x][y][i];\n");
-    for (id, e) in &mk.lets {
-        let _ = writeln!(s, "          const float e{id} = {};", gx.e(e));
-    }
-    let _ = writeln!(
-        s,
-        "          b{}[{}] = {};",
-        map[&mk.out],
-        gx.lin(&mk.out_idx),
-        gx.e(&mk.epi)
-    );
+    s.push_str(&epilogue(mk, &gx, &map, "          "));
     s.push_str("        }\n      }\n}\n");
     s.push_str(&emu_entry(&args));
     GpuKernel {

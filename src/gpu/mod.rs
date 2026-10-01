@@ -97,6 +97,14 @@ struct Launch {
 enum GStep {
     Kernel(Launch),
     Host(usize),
+    /// A host Gather of rows of a constant f32 table, done on the device:
+    /// only the indices are uploaded.
+    Gather {
+        node: usize,
+        idx: DevPtr,
+        launch: Launch,
+        dim: i64,
+    },
 }
 
 impl Dev {
@@ -204,6 +212,7 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
     let mut by_src: HashMap<String, String> = HashMap::new();
     let mut unique = Vec::new();
     let mut source = String::from(codegen::PRELUDE);
+    source.push_str(codegen::GATHER);
     let mut names = Vec::new();
     for k in &kernels {
         let name = by_src
@@ -285,14 +294,16 @@ impl GpuExecutable {
                 let nv = Nvrtc::open()?;
                 let arch = (c.cc.0 * 10 + c.cc.1) as u32;
                 let (bin, cached) = compile_cubin(&nv, &gn.source, arch)?;
-                let fs = c.load(&bin, &gn.unique)?;
+                let mut names = gn.unique.clone();
+                names.push("kgather".into());
+                let fs = c.load(&bin, &names)?;
                 (Funcs::Cuda(fs), cached)
             }
             Dev::Emu(_) => {
                 let cxx = std::env::var("CXX").unwrap_or_else(|_| "c++".into());
                 let lib = jit::compile_with(&cxx, EMU_FLAGS, &["-lm"], "cpp", &gn.source)?;
                 let mut fs = Vec::new();
-                for n in &gn.unique {
+                for n in gn.unique.iter().map(String::as_str).chain(["kgather"]) {
                     let p = lib.symbol(&format!("{n}_emu"))?;
                     // SAFETY: every emulator entry point has this signature.
                     fs.push(unsafe { std::mem::transmute::<*mut std::ffi::c_void, EmuFn>(p) });
@@ -323,8 +334,54 @@ impl GpuExecutable {
         for step in &plan.steps {
             match step {
                 Step::Host(p) => {
-                    steps.push(GStep::Host(*p));
                     host += 1;
+                    let n = &g.nodes[*p];
+                    // Gather along axis 0 of a constant f32 table, by
+                    // indices only known at run time, into the arena.
+                    let table = n.inputs.first().copied().flatten().and_then(|t| g.konst(t));
+                    let ind = n.inputs.get(1).copied().flatten();
+                    let out = n.outputs[0];
+                    if n.op == "Gather"
+                        && n.attr_int("axis", 0) == 0
+                        && let (Some(t), Some(ind)) = (table, ind)
+                        && t.dtype() == DType::F32
+                        && g.konst(ind).is_none()
+                        && plan.materialized[out]
+                        && offsets.contains_key(&out)
+                    {
+                        let tp = match consts.get(&n.inputs[0].unwrap()) {
+                            Some(&p) => p,
+                            None => {
+                                let p = dev.upload(t.as_f32())?;
+                                consts.insert(n.inputs[0].unwrap(), p);
+                                p
+                            }
+                        };
+                        let count = numel(g.shape(ind));
+                        let row = t.len() / t.shape[0];
+                        let idx = dev.alloc(count)?;
+                        steps.push(GStep::Gather {
+                            node: *p,
+                            idx,
+                            launch: Launch {
+                                func: gn.unique.len(),
+                                grid: [(count * row).div_ceil(256) as u32, 1, 1],
+                                block: 256,
+                                smem: 0,
+                                args: vec![
+                                    arena + 4 * offsets[&out] as DevPtr,
+                                    tp,
+                                    idx,
+                                    count as DevPtr,
+                                    row as DevPtr,
+                                ],
+                                name: "kgather".into(),
+                            },
+                            dim: t.shape[0] as i64,
+                        });
+                    } else {
+                        steps.push(GStep::Host(*p));
+                    }
                 }
                 Step::Kernel(k) => {
                     let (gk, name) = kernel_steps.next().unwrap();
@@ -486,9 +543,36 @@ impl GpuExecutable {
         }
         let mut si = 0;
         while si < self.steps.len() {
+            if let GStep::Gather {
+                node,
+                idx,
+                launch,
+                dim,
+            } = &self.steps[si]
+            {
+                let g = &self.plan.g;
+                let iv = g.nodes[*node].inputs[1].unwrap();
+                let ind = env.get(&iv).ok_or_else(|| {
+                    format!("gather indices {} not on the host", g.values[iv].name)
+                })?;
+                let mut words = Vec::with_capacity(ind.len());
+                for mut i in ind.to_i64() {
+                    if i < 0 {
+                        i += dim;
+                    }
+                    if !(0..*dim).contains(&i) {
+                        return Err(format!("gather index {i} out of range 0..{dim}"));
+                    }
+                    words.push(f32::from_bits(i as u32));
+                }
+                self.dev.h2d(*idx, &words)?;
+                self.launch(launch)?;
+                si += 1;
+                continue;
+            }
             let host = match &self.steps[si] {
                 GStep::Host(p) => Some(*p),
-                GStep::Kernel(_) => None,
+                GStep::Kernel(_) | GStep::Gather { .. } => None,
             };
             match host {
                 Some(p) => {

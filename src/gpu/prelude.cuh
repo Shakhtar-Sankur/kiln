@@ -41,6 +41,20 @@ KDEV void kmma(float *c, unsigned a0, unsigned a1, unsigned b0) {
       : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
       : "r"(a0), "r"(a1), "r"(b0));
 }
+// Vector memory access: 4 floats, 8 halves (16 bytes, aligned).
+typedef float4 kf4;
+typedef uint4 kh8;
+KDEV kf4 kld4(const float *p) { return *(const kf4 *)p; }
+KDEV kf4 kz4() { return make_float4(0.0f, 0.0f, 0.0f, 0.0f); }
+KDEV kh8 kld8h(const khalf *p) { return *(const kh8 *)p; }
+KDEV kh8 kz8h() { return make_uint4(0, 0, 0, 0); }
+KDEV void kst8h(khalf *p, kh8 v) { *(kh8 *)p = v; }
+KDEV void kst4h(khalf *p, kf4 v) {
+  uint2 u;
+  u.x = (unsigned)kf2h(v.x) | ((unsigned)kf2h(v.y) << 16);
+  u.y = (unsigned)kf2h(v.z) | ((unsigned)kf2h(v.w) << 16);
+  *(uint2 *)p = u;
+}
 #else
 #include <math.h>
 #include <pthread.h>
@@ -150,6 +164,29 @@ static inline void kmma(float *c, unsigned a0, unsigned a1, unsigned b0) {
     c[i] += s;
   }
   KWSYNC();
+}
+struct kf4 {
+  float x, y, z, w;
+};
+struct kh8 {
+  unsigned x, y, z, w;
+};
+static inline kf4 kld4(const float *p) {
+  kf4 v;
+  memcpy(&v, p, 16);
+  return v;
+}
+static inline kf4 kz4() { return kf4{0.0f, 0.0f, 0.0f, 0.0f}; }
+static inline kh8 kld8h(const khalf *p) {
+  kh8 v;
+  memcpy(&v, p, 16);
+  return v;
+}
+static inline kh8 kz8h() { return kh8{0, 0, 0, 0}; }
+static inline void kst8h(khalf *p, kh8 v) { memcpy(p, &v, 16); }
+static inline void kst4h(khalf *p, kf4 v) {
+  khalf h[4] = {kf2h(v.x), kf2h(v.y), kf2h(v.z), kf2h(v.w)};
+  memcpy(p, h, 8);
 }
 struct KStart {
   KTeam *t;
