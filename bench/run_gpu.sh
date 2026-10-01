@@ -26,7 +26,7 @@ run() {
   case $c in
     kiln) $K run models/$m.onnx models/$m.ref --device cuda --iters $n --json $OUT/gpu_runs.jsonl --label kiln > /dev/null ;;
     half) $K run models/$m.onnx models/$m.ref --device cuda --half --iters $n --json $OUT/gpu_runs.jsonl --label "kiln fp16" > /dev/null ;;
-    baselines) (cd scripts && $PY bench_gpu.py ../models $m --iters $n --json ../$OUT/gpu_runs.jsonl) ;;
+    baselines) (cd scripts && $PY bench_gpu.py ../models $m --iters $n --json ../$OUT/gpu_runs.jsonl) || echo "baselines for $m failed" ;;
     *) $K run models/$m.onnx models/$m.ref --device cuda --iters $n --$c --json $OUT/gpu_runs.jsonl --label "kiln --$c" > /dev/null ;;
   esac
 }

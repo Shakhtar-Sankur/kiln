@@ -21,11 +21,12 @@ use crate::ir::{Buf, E, Lin, Ranges, Var, linearize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-/// Shared-memory budget of the fused kernel (the default per-block limit).
-const SMEM_LIMIT: usize = 48 * 1024;
-const THREADS: usize = 128;
-/// Rows of K (scores phase) and of V (output phase) staged at a time.
+/// Shared-memory limit of the fused kernel (sm_75's maximum per block).
+const SMEM_LIMIT: usize = 64 * 1024;
+/// Rows of V staged at a time (output phase).
 const CHUNK: usize = 32;
+/// Columns of scores computed per chunk (rows of K staged at a time).
+const CHUNK2: usize = 64;
 /// Row-buffer ids standing for the scores and probabilities rows.
 const SID: u32 = u32::MAX - 1;
 const PID: u32 = u32::MAX - 2;
@@ -145,7 +146,7 @@ pub fn find(plan: &Plan) -> Vec<[usize; 3]> {
         };
         if matches(m1, lk, m3) && only(m1.out, i + 1) {
             let p = p_value(lk).unwrap();
-            if only(p, i + 2) && attention_kernel(m1, lk, m3).is_some() {
+            if only(p, i + 2) && default_params(m1, lk, m3).is_some() {
                 out.push([i, i + 1, i + 2]);
             }
         }
@@ -239,11 +240,82 @@ fn matches(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> bool {
     true
 }
 
-/// The fused kernel, if its shared memory fits.
-pub fn attention_kernel(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> Option<GpuKernel> {
+/// A fused kernel's shape: BM query rows per block, NT threads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AttnParams {
+    pub bm: usize,
+    pub nt: usize,
+}
+
+/// The shapes the tuner times (those whose shared memory fits).
+pub fn space() -> Vec<AttnParams> {
+    [(16, 128), (32, 128), (32, 256), (64, 256)]
+        .into_iter()
+        .map(|(bm, nt)| AttnParams { bm, nt })
+        .collect()
+}
+
+/// Whether the probabilities may overwrite the scores row: no stage from
+/// the one that writes them on reads the scores.
+fn alias_ok(rk: &LoopK) -> bool {
+    let Some(at) = rk
+        .stages
+        .iter()
+        .position(|s| matches!(s, Stage::RowBuf { id, .. } if *id == PID))
+    else {
+        return false;
+    };
+    rk.stages[at..].iter().all(|st| {
+        let body = match st {
+            Stage::Reduce { body, .. }
+            | Stage::Scalar { body, .. }
+            | Stage::RowBuf { body, .. }
+            | Stage::Store { body, .. } => body,
+        };
+        let mut b = Vec::new();
+        body.loads(&mut b);
+        !b.contains(&Buf::Row(SID))
+    })
+}
+
+/// The fused kernel with shape `p`, if its shared memory fits.
+pub fn attention_kernel(
+    m1: &MatmulK,
+    lk: &LoopK,
+    m3: &MatmulK,
+    p: AttnParams,
+) -> Option<GpuKernel> {
     let s_val = m1.out;
     let p_val = p_value(lk)?;
     let (n1, k1, n2) = (m1.n, m1.k, m3.n);
+    let AttnParams { bm, nt } = p;
+    // The row kernel, with scores and probabilities as row buffers.
+    let jv = lk.j.0;
+    let mut rk = lk.clone();
+    let rw = |e: &E| to_row(&to_row(e, s_val, SID, jv), p_val, PID, jv);
+    rk.stages = lk
+        .stages
+        .iter()
+        .map(|st| match st {
+            Stage::Reduce { id, op, body } => Stage::Reduce {
+                id: *id,
+                op: *op,
+                body: rw(body),
+            },
+            Stage::Scalar { id, body } => Stage::Scalar {
+                id: *id,
+                body: rw(body),
+            },
+            Stage::RowBuf { id, body } => Stage::RowBuf {
+                id: *id,
+                body: rw(body),
+            },
+            Stage::Store { body, .. } => Stage::RowBuf {
+                id: PID,
+                body: rw(body),
+            },
+        })
+        .collect();
     let rowbufs: Vec<u32> = lk
         .stages
         .iter()
@@ -252,78 +324,51 @@ pub fn attention_kernel(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> Option<GpuKer
             _ => None,
         })
         .collect();
-    // Rows per block: the most that fit in shared memory (scores,
-    // probabilities and row buffers for each row, plus the Q rows and one
-    // chunk each of K and V), in whole passes of the row groups.
+    let alias = alias_ok(&rk);
+    // Thread layouts. Scores: 16 column groups (columns tx + 16 q of a
+    // 64-column chunk) by NT/16 row groups; outputs likewise over n2.
+    let (sx, sy) = (16usize, nt / 16);
+    if bm % sy != 0 {
+        return None;
+    }
+    let (tm, tn1) = (bm / sy, CHUNK2 / sx);
+    let tn3 = n2.div_ceil(sx);
     let tpr = n1.next_power_of_two().clamp(1, 32);
-    let rp = THREADS / tpr;
-    let floats = |bm: usize| {
-        (2 + rowbufs.len()) * bm * n1 + bm * (k1 + 1) + CHUNK * (k1 + 1) + CHUNK * (n2 + 1)
-    };
-    let bm = [32usize, 16, 8, 4]
-        .into_iter()
-        .map(|b| b.div_ceil(rp) * rp)
-        .find(|&b| floats(b) * 4 <= SMEM_LIMIT)?;
-    // The row kernel, with scores and probabilities as row buffers.
-    let jv = lk.j.0;
-    let mut rk = lk.clone();
-    rk.stages = lk
-        .stages
-        .iter()
-        .map(|st| match st {
-            Stage::Reduce { id, op, body } => Stage::Reduce {
-                id: *id,
-                op: *op,
-                body: to_row(&to_row(body, s_val, SID, jv), p_val, PID, jv),
-            },
-            Stage::Scalar { id, body } => Stage::Scalar {
-                id: *id,
-                body: to_row(&to_row(body, s_val, SID, jv), p_val, PID, jv),
-            },
-            Stage::RowBuf { id, body } => Stage::RowBuf {
-                id: *id,
-                body: to_row(&to_row(body, s_val, SID, jv), p_val, PID, jv),
-            },
-            Stage::Store { body, .. } => Stage::RowBuf {
-                id: PID,
-                body: to_row(&to_row(body, s_val, SID, jv), p_val, PID, jv),
-            },
-        })
-        .collect();
+    let rp = nt / tpr;
+    if bm % rp != 0 {
+        return None;
+    }
+    let (k1p, n2p) = (k1 + 1, n2 + 1);
+    let rows_floats = (if alias { 1 } else { 2 } + rowbufs.len()) * bm * n1;
+    let stage_floats = (bm * k1p + CHUNK2 * k1p).max(CHUNK * n2p);
+    let floats = rows_floats + stage_floats;
+    if floats * 4 > SMEM_LIMIT {
+        return None;
+    }
     // Arguments: the output, then everything any phase reads.
-    let mut exprs: Vec<&E> = vec![&m1.a, &m1.epi, &m3.epi];
-    exprs.extend(m1.lets.iter().map(|l| &l.1));
-    exprs.extend(m3.lets.iter().map(|l| &l.1));
     let (BOp::Expr(b1), BOp::Expr(b3)) = (&m1.b, &m3.b) else {
         return None;
     };
-    exprs.push(b1);
-    exprs.push(b3);
-    let row_exprs: Vec<&E> = rk
-        .stages
-        .iter()
-        .map(|s| match s {
+    let mut exprs: Vec<&E> = vec![&m1.a, &m1.epi, &m3.epi, b1, b3];
+    exprs.extend(m1.lets.iter().map(|l| &l.1));
+    exprs.extend(m3.lets.iter().map(|l| &l.1));
+    for st in &rk.stages {
+        match st {
             Stage::Reduce { body, .. }
             | Stage::Scalar { body, .. }
             | Stage::RowBuf { body, .. }
-            | Stage::Store { body, .. } => body,
-        })
-        .collect();
-    exprs.extend(row_exprs);
+            | Stage::Store { body, .. } => exprs.push(body),
+        }
+    }
     let (args, map) = collect_args(&exprs, &[m3.out]);
-    let floats = floats(bm);
     let batch: usize = m1.batch.iter().map(|b| b.1).product();
     let m = m1.m;
-    let (k1p, n2p) = (k1 + 1, n2 + 1);
     let mut s = String::new();
-    let _ = writeln!(s, "{} {{", signature(THREADS, &args, 1));
+    let _ = writeln!(s, "{} {{", signature(nt, &args, 1));
     s.push_str("  SMEM;\n");
-    let _ = writeln!(
-        s,
-        "  float *Ss = (float *)kiln_smem, *Ps = Ss + {};",
-        bm * n1
-    );
-    let mut off = 2 * bm * n1;
+    let p_off = if alias { 0 } else { bm * n1 };
+    let _ = writeln!(s, "  float *Ss = (float *)kiln_smem, *Ps = Ss + {p_off};");
+    let mut off = if alias { bm * n1 } else { 2 * bm * n1 };
     let mut rb_off = Vec::new();
     for _ in &rowbufs {
         rb_off.push(off);
@@ -331,47 +376,51 @@ pub fn attention_kernel(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> Option<GpuKer
     }
     let _ = writeln!(
         s,
-        "  float *Qs = (float *)kiln_smem + {off}, *Ks = Qs + {}, *Vs = Ks + {};",
-        bm * k1p,
-        CHUNK * k1p
+        "  float *Qs = (float *)kiln_smem + {off}, *Ks = Qs + {}, *Vs = (float *)kiln_smem + {off};",
+        bm * k1p
     );
     let _ = writeln!(
         s,
-        "  const int tid = threadIdx.x, m0 = blockIdx.x * {bm}, tb = blockIdx.y;"
+        "  const int tid = threadIdx.x, tx = tid % {sx}, ty = tid / {sx}, m0 = blockIdx.x * {bm}, tb = blockIdx.y;"
     );
-    // Phase 1: scores of rows m0..m0+BM, chunk by chunk of K's rows.
+    // Phase 1: scores, a TM x TN1 register tile per thread per chunk.
     let g1 = Gx::new(&map, mm_names(m1), Some("acc".into()), true);
     s.push_str("  {\n");
     s.push_str(&decode(&m1.batch, "tb", "    "));
     let _ = writeln!(
         s,
-        "    for (int e = tid; e < {}; e += {THREADS}) {{ const int r = e / {k1}, kk = e % {k1}, _i = m0 + r, _k = kk; Qs[r * {k1p} + kk] = (_i < {m}) ? {} : 0.0f; }}",
+        "    for (int e = tid; e < {}; e += {nt}) {{ const int r = e / {k1}, kk = e % {k1}, _i = m0 + r, _k = kk; Qs[r * {k1p} + kk] = (_i < {m}) ? {} : 0.0f; }}",
         bm * k1,
         g1.e(&m1.a)
     );
-    let _ = writeln!(s, "    for (int j0 = 0; j0 < {n1}; j0 += {CHUNK}) {{");
+    let _ = writeln!(s, "    for (int j0 = 0; j0 < {n1}; j0 += {CHUNK2}) {{");
     s.push_str("      KSYNC();\n");
     let _ = writeln!(
         s,
-        "      for (int e = tid; e < {}; e += {THREADS}) {{ const int jj = e / {k1}, kk = e % {k1}, _j = j0 + jj, _k = kk; Ks[jj * {k1p} + kk] = (_j < {n1}) ? {} : 0.0f; }}",
-        CHUNK * k1,
+        "      for (int e = tid; e < {}; e += {nt}) {{ const int jj = e / {k1}, kk = e % {k1}, _j = j0 + jj, _k = kk; Ks[jj * {k1p} + kk] = (_j < {n1}) ? {} : 0.0f; }}",
+        CHUNK2 * k1,
         g1.e(b1)
     );
     s.push_str("      KSYNC();\n");
+    let _ = writeln!(s, "      float c[{tm}][{tn1}];");
     let _ = writeln!(
         s,
-        "      for (int o = tid; o < {}; o += {THREADS}) {{\n        const int r = o / {CHUNK}, jj = o % {CHUNK}, _i = m0 + r, _j = j0 + jj;\n        if (_j < {n1}) {{\n          float acc = 0.0f;\n          #pragma unroll 8\n          for (int kk = 0; kk < {k1}; kk++) acc += Qs[r * {k1p} + kk] * Ks[jj * {k1p} + kk];",
-        bm * CHUNK
+        "      #pragma unroll\n      for (int r = 0; r < {tm}; r++)\n        #pragma unroll\n        for (int q = 0; q < {tn1}; q++) c[r][q] = 0.0f;"
     );
-    let _ = writeln!(s, "          if (_i < {m}) {{");
-    let mut ep = String::new();
+    let _ = writeln!(
+        s,
+        "      #pragma unroll 4\n      for (int kk = 0; kk < {k1}; kk++) {{\n        float a[{tm}], w[{tn1}];\n        #pragma unroll\n        for (int r = 0; r < {tm}; r++) a[r] = Qs[(ty + r * {sy}) * {k1p} + kk];\n        #pragma unroll\n        for (int q = 0; q < {tn1}; q++) w[q] = Ks[(tx + q * {sx}) * {k1p} + kk];\n        #pragma unroll\n        for (int r = 0; r < {tm}; r++)\n          #pragma unroll\n          for (int q = 0; q < {tn1}; q++) c[r][q] += a[r] * w[q];\n      }}"
+    );
+    let _ = writeln!(
+        s,
+        "      #pragma unroll\n      for (int r = 0; r < {tm}; r++)\n        #pragma unroll\n        for (int q = 0; q < {tn1}; q++) {{\n          const int rr = ty + r * {sy}, _i = m0 + rr, _j = j0 + tx + q * {sx};\n          if (_j < {n1}) {{\n            if (_i < {m}) {{\n              const float acc = c[r][q];"
+    );
     for (id, e) in &m1.lets {
-        let _ = writeln!(ep, "            const float e{id} = {};", g1.e(e));
+        let _ = writeln!(s, "              const float e{id} = {};", g1.e(e));
     }
-    let _ = writeln!(ep, "            Ss[r * {n1} + _j] = {};", g1.e(&m1.epi));
-    s.push_str(&ep);
-    let _ = writeln!(s, "          }} else Ss[r * {n1} + _j] = 0.0f;");
-    s.push_str("        }\n      }\n    }\n  }\n  KSYNC();\n");
+    let _ = writeln!(s, "              Ss[rr * {n1} + _j] = {};", g1.e(&m1.epi));
+    let _ = writeln!(s, "            }} else Ss[rr * {n1} + _j] = 0.0f;");
+    s.push_str("          }\n        }\n    }\n  }\n  KSYNC();\n");
     // Phase 2: the row kernel over the BM rows, a group of TPR threads per row.
     let g2 = Gx::new(&map, HashMap::new(), None, false);
     let _ = writeln!(s, "  for (int r0 = 0; r0 < {bm}; r0 += {rp}) {{");
@@ -395,46 +444,60 @@ pub fn attention_kernel(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> Option<GpuKer
     s.push_str("    (void)live;\n");
     s.push_str(&indent(&stage_code(&rk, &g2, &map, tpr), "  "));
     s.push_str("  }\n  KSYNC();\n");
-    // Phase 3: the output rows, chunk by chunk of V's rows.
+    // Phase 3: outputs, a TM x TN3 register tile per thread.
     let g3 = Gx::new(&map, mm_names(m3), Some("acc".into()), true);
-    let q3 = (bm * n2).div_ceil(THREADS);
     s.push_str("  {\n");
     s.push_str(&decode(&m3.batch, "tb", "    "));
-    let _ = writeln!(s, "    float c[{q3}];");
+    let _ = writeln!(s, "    float c[{tm}][{tn3}];");
     let _ = writeln!(
         s,
-        "    #pragma unroll\n    for (int q = 0; q < {q3}; q++) c[q] = 0.0f;"
+        "    #pragma unroll\n    for (int r = 0; r < {tm}; r++)\n      #pragma unroll\n      for (int q = 0; q < {tn3}; q++) c[r][q] = 0.0f;"
     );
     let _ = writeln!(s, "    for (int k0 = 0; k0 < {n1}; k0 += {CHUNK}) {{");
     let _ = writeln!(
         s,
-        "      for (int e = tid; e < {}; e += {THREADS}) {{ const int kk = e / {n2}, jj = e % {n2}, _k = k0 + kk, _j = jj; Vs[kk * {n2p} + jj] = (_k < {n1}) ? {} : 0.0f; }}",
+        "      for (int e = tid; e < {}; e += {nt}) {{ const int kk = e / {n2}, jj = e % {n2}, _k = k0 + kk, _j = jj; Vs[kk * {n2p} + jj] = (_k < {n1}) ? {} : 0.0f; }}",
         CHUNK * n2,
         g3.e(b3)
     );
     s.push_str("      KSYNC();\n");
     let _ = writeln!(
         s,
-        "      #pragma unroll\n      for (int q = 0; q < {q3}; q++) {{\n        const int o = tid + q * {THREADS}, r = o / {n2}, jj = o % {n2};\n        if (o < {}) {{\n          const int kn = {n1} - k0 < {CHUNK} ? {n1} - k0 : {CHUNK};\n          for (int kk = 0; kk < kn; kk++) c[q] += Ps[r * {n1} + k0 + kk] * Vs[kk * {n2p} + jj];\n        }}\n      }}",
-        bm * n2
+        "      const int kn = {n1} - k0 < {CHUNK} ? {n1} - k0 : {CHUNK};\n      for (int kk = 0; kk < kn; kk++) {{\n        float a[{tm}], w[{tn3}];\n        #pragma unroll\n        for (int r = 0; r < {tm}; r++) a[r] = Ps[(ty + r * {sy}) * {n1} + k0 + kk];\n        #pragma unroll\n        for (int q = 0; q < {tn3}; q++) w[q] = (tx + q * {sx} < {n2}) ? Vs[kk * {n2p} + tx + q * {sx}] : 0.0f;\n        #pragma unroll\n        for (int r = 0; r < {tm}; r++)\n          #pragma unroll\n          for (int q = 0; q < {tn3}; q++) c[r][q] += a[r] * w[q];\n      }}"
     );
     s.push_str("      KSYNC();\n    }\n");
     let _ = writeln!(
         s,
-        "    #pragma unroll\n    for (int q = 0; q < {q3}; q++) {{\n      const int o = tid + q * {THREADS}, r = o / {n2}, _j = o % {n2}, _i = m0 + r;\n      if (o < {} && _i < {m}) {{\n        const float acc = c[q];",
-        bm * n2
+        "    #pragma unroll\n    for (int r = 0; r < {tm}; r++)\n      #pragma unroll\n      for (int q = 0; q < {tn3}; q++) {{\n        const int _i = m0 + ty + r * {sy}, _j = tx + q * {sx};\n        if (_i < {m} && _j < {n2}) {{\n          const float acc = c[r][q];"
     );
-    s.push_str(&epilogue(m3, &g3, &map, "        "));
-    s.push_str("      }\n    }\n  }\n}\n");
+    s.push_str(&epilogue(m3, &g3, &map, "          "));
+    s.push_str("        }\n      }\n  }\n}\n");
     s.push_str(&emu_entry(&args));
     Some(GpuKernel {
         src: s,
         args,
         outs: vec![m3.out],
         grid: [m.div_ceil(bm) as u32, batch as u32, 1],
-        block: THREADS as u32,
+        block: nt as u32,
         smem: (floats * 4) as u32,
     })
+}
+
+/// The tuning key of an attention pattern: its two matmuls and precision.
+pub fn key(m1: &MatmulK, m3: &MatmulK, half: bool) -> String {
+    format!(
+        "attn_{}_{}{}",
+        crate::runtime::matmul_signature(m1),
+        crate::runtime::matmul_signature(m3),
+        if half { "_f16" } else { "" }
+    )
+}
+
+/// The default shape: the smallest block that fits (most blocks per SM).
+pub fn default_params(m1: &MatmulK, lk: &LoopK, m3: &MatmulK) -> Option<AttnParams> {
+    space()
+        .into_iter()
+        .find(|p| attention_kernel(m1, lk, m3, *p).is_some())
 }
 
 fn indent(code: &str, pre: &str) -> String {

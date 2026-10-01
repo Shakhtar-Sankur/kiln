@@ -7,6 +7,8 @@
 #
 # In Colab (Runtime > Change runtime type > T4 GPU), one cell:
 #   !git clone https://github.com/Shakhtar-Sankur/kiln && cd kiln && bash scripts/colab.sh
+# Again in the same session (reuses the build, models and tuning):
+#   !cd kiln && git pull && bash scripts/colab.sh
 #
 # Usage: bash scripts/colab.sh [ROUNDS]
 set -u
@@ -29,6 +31,26 @@ fi
 source "$HOME/.cargo/env"
 rustc --version | tee -a "$REPORT"
 pip install -q onnx onnxruntime-gpu 2>&1 | tail -2
+# onnxruntime-gpu must match the machine's CUDA: try releases until one
+# creates a CUDA session.
+ort_cuda() {
+  python3 - <<'PY' 2>/dev/null
+import onnxruntime as o
+from onnx import helper, TensorProto
+g = helper.make_graph([helper.make_node("Relu", ["x"], ["y"])], "g",
+                      [helper.make_tensor_value_info("x", TensorProto.FLOAT, [1])],
+                      [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])])
+m = helper.make_model(g, opset_imports=[helper.make_opsetid("", 17)])
+m.ir_version = 8
+s = o.InferenceSession(m.SerializeToString(), providers=["CUDAExecutionProvider"])
+assert "CUDAExecutionProvider" in s.get_providers()
+PY
+}
+for v in "" 1.23.2 1.22.0; do
+  if [ -n "$v" ]; then pip install -q "onnxruntime-gpu==$v" 2>&1 | tail -1; fi
+  if ort_cuda; then log "onnxruntime CUDA provider works (onnxruntime-gpu ${v:-latest})"; break; fi
+  log "onnxruntime-gpu ${v:-latest}: no CUDA provider on this machine"
+done
 python3 -c "import torch, transformers, onnxruntime as o; print('torch', torch.__version__, 'cuda', torch.version.cuda, '| transformers', transformers.__version__, '| onnxruntime', o.__version__, o.get_available_providers())" 2>&1 | tee -a "$REPORT"
 python3 -c "import jax; print('jax', jax.__version__, jax.devices())" 2>&1 | tail -1 | tee -a "$REPORT"
 ls /usr/local/cuda/lib64/libnvrtc.so* 2>/dev/null | head -1 | tee -a "$REPORT"
@@ -40,14 +62,19 @@ from huggingface_hub import snapshot_download
 snapshot_download("BAAI/bge-small-en-v1.5", local_dir="models/bge-small")
 snapshot_download("HuggingFaceTB/SmolLM2-135M", local_dir="models/smollm2-135m")
 PY
-python3 scripts/export_models.py models mlp bert llama 2>&1 | grep -v Warning | tail -5 | tee -a "$REPORT"
+if [ -f models/llama.ref ] && [ -f models/bert.ref ] && [ -f models/mlp.ref ]; then
+  log "models already exported"
+else
+  python3 scripts/export_models.py models mlp bert llama 2>&1 | grep -v Warning | tail -5 | tee -a "$REPORT"
+fi
 
 step "build"
 cargo build --release 2>&1 | tail -2 | tee -a "$REPORT"
 K=./target/release/kiln
 
-step "GPU tests (emulator and this GPU)"
-cargo test --release --test gpu -- --nocapture 2>&1 | grep -E "^test |test result|panicked|also testing|no GPU|max \|diff\||error" | tee -a "$REPORT"
+# The emulator tests run in CI; here (2 slow cores) test on the GPU only.
+step "GPU tests (on this GPU)"
+KILN_TEST_EMU=0 cargo test --release --test gpu -- --nocapture 2>&1 | grep -E "^test |test result|panicked|also testing|no GPU|max \|diff\||error" | tee -a "$REPORT"
 
 step "first run, tuning and per-kernel profile"
 for m in mlp bert llama; do
@@ -68,9 +95,12 @@ done
 step "benchmark ($ROUNDS rounds)"
 bench/run_gpu.sh "$ROUNDS" python3 2>&1 | grep -v "^round" | tee -a "$REPORT"
 
+step "tuner choices"
+cat "$HOME/.cache/kiln/gtune_attn.txt" >> "$REPORT" 2>/dev/null
+cat "$HOME/.cache/kiln/gtune.txt" >> "$REPORT" 2>/dev/null
+
 step "raw timings (bench/results/gpu_runs.jsonl)"
 cat bench/results/gpu_runs.jsonl >> "$REPORT"
-cat "$HOME/.cache/kiln/gtune.txt" >> "$REPORT" 2>/dev/null
 
 echo
 echo "=================== KILN COLAB REPORT BEGIN ==================="

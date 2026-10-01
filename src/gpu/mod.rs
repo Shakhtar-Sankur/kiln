@@ -42,6 +42,10 @@ pub struct GpuOptions {
     pub half: bool,
     /// Fuse scores, softmax and output matmul into one kernel.
     pub attention: bool,
+    /// The tuner's choice per attention pattern (by `attention::key`):
+    /// fused with a shape, or not fused. Untuned patterns are fused with
+    /// the default shape.
+    pub attn: HashMap<String, Option<attention::AttnParams>>,
 }
 
 /// The schedule table key of a matmul: its signature, and the precision.
@@ -59,6 +63,7 @@ impl GpuOptions {
             graphs: true,
             half: false,
             attention: true,
+            attn: HashMap::new(),
         }
     }
 }
@@ -212,7 +217,11 @@ pub fn generate(plan: &Plan, opts: &GpuOptions, sms: usize) -> Generated {
                 Step::Kernel(Kernel::Loop(lk)),
                 Step::Kernel(Kernel::Matmul(m3)),
             ) = (&plan.steps[a], &plan.steps[b], &plan.steps[c])
-                && let Some(k) = attention::attention_kernel(m1, lk, m3)
+                && let Some(p) = match opts.attn.get(&attention::key(m1, m3, opts.half)) {
+                    Some(choice) => *choice,
+                    None => attention::default_params(m1, lk, m3),
+                }
+                && let Some(k) = attention::attention_kernel(m1, lk, m3, p)
             {
                 fused.insert(a, k);
                 skip.insert(b);

@@ -90,36 +90,73 @@ fn bstrides(shape: &[usize], out: &[usize]) -> Vec<usize> {
         .collect()
 }
 
+/// Visits every position of `out` in row-major order, passing the offset
+/// into each input (whose strides, 0 where broadcast, are `st`). Offsets
+/// advance incrementally: the innermost dimension in a tight loop, carries
+/// only on the outer ones.
+fn walk(out: &[usize], st: &[Vec<usize>], mut f: impl FnMut(&[usize])) {
+    let n = numel(out);
+    if n == 0 {
+        return;
+    }
+    let r = out.len();
+    let k = st.len();
+    let mut cur = vec![0usize; k];
+    if r == 0 {
+        f(&cur);
+        return;
+    }
+    let inner = out[r - 1];
+    let step: Vec<usize> = st.iter().map(|s| s[r - 1]).collect();
+    let mut idx = vec![0usize; r];
+    let mut base = vec![0usize; k];
+    for _ in 0..n / inner {
+        cur.copy_from_slice(&base);
+        for _ in 0..inner {
+            f(&cur);
+            for q in 0..k {
+                cur[q] += step[q];
+            }
+        }
+        for d in (0..r - 1).rev() {
+            idx[d] += 1;
+            for q in 0..k {
+                base[q] += st[q][d];
+            }
+            if idx[d] < out[d] {
+                break;
+            }
+            for q in 0..k {
+                base[q] -= st[q][d] * out[d];
+            }
+            idx[d] = 0;
+        }
+    }
+}
+
 /// Offsets into each input for every output position, in order.
 fn offsets(out: &[usize], ins: &[&[usize]]) -> Vec<Vec<usize>> {
     let n = numel(out);
     let st: Vec<Vec<usize>> = ins.iter().map(|s| bstrides(s, out)).collect();
     let mut res = vec![Vec::with_capacity(n); ins.len()];
-    let mut idx = vec![0usize; out.len()];
-    for _ in 0..n {
-        for (k, s) in st.iter().enumerate() {
-            res[k].push(idx.iter().zip(s).map(|(a, b)| a * b).sum());
+    walk(out, &st, |o| {
+        for (r, &x) in res.iter_mut().zip(o) {
+            r.push(x);
         }
-        for d in (0..out.len()).rev() {
-            idx[d] += 1;
-            if idx[d] < out[d] {
-                break;
-            }
-            idx[d] = 0;
-        }
-    }
+    });
     res
 }
 
 fn binary_f32(a: &Tensor, b: &Tensor, f: impl Fn(f32, f32) -> f32) -> Result<Tensor, String> {
     let out = broadcast_shape(&a.shape, &b.shape)?;
-    let o = offsets(&out, &[&a.shape, &b.shape]);
     let (x, y) = (a.as_f32(), b.as_f32());
-    let v = o[0]
-        .iter()
-        .zip(&o[1])
-        .map(|(&i, &j)| f(x[i], y[j]))
-        .collect();
+    let mut v = Vec::with_capacity(numel(&out));
+    if a.shape == out && b.shape == out {
+        v.extend(x.iter().zip(y).map(|(&p, &q)| f(p, q)));
+    } else {
+        let st = [bstrides(&a.shape, &out), bstrides(&b.shape, &out)];
+        walk(&out, &st, |o| v.push(f(x[o[0]], y[o[1]])));
+    }
     Ok(Tensor::f32(out, v))
 }
 
@@ -416,14 +453,17 @@ pub fn eval(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<Tensor>, String> {
         "LessOrEqual" => compare(x(0), x(1), |a, b| a <= b)?,
         "And" | "Or" => {
             let out = broadcast_shape(&x(0).shape, &x(1).shape)?;
-            let o = offsets(&out, &[&x(0).shape, &x(1).shape]);
+            let st = [bstrides(&x(0).shape, &out), bstrides(&x(1).shape, &out)];
             let (a, b) = (x(0).as_bool(), x(1).as_bool());
             let and = n.op == "And";
-            let v = o[0]
-                .iter()
-                .zip(&o[1])
-                .map(|(&i, &j)| if and { a[i] && b[j] } else { a[i] || b[j] })
-                .collect();
+            let mut v = Vec::with_capacity(numel(&out));
+            walk(&out, &st, |o| {
+                v.push(if and {
+                    a[o[0]] && b[o[1]]
+                } else {
+                    a[o[0]] || b[o[1]]
+                })
+            });
             Tensor::bool(out, v)
         }
         "Not" => Tensor::bool(
@@ -433,23 +473,28 @@ pub fn eval(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<Tensor>, String> {
         "Where" => {
             let (c, a, b) = (x(0), x(1), x(2));
             let out = broadcast_shape(&broadcast_shape(&c.shape, &a.shape)?, &b.shape)?;
-            let o = offsets(&out, &[&c.shape, &a.shape, &b.shape]);
+            let st = [
+                bstrides(&c.shape, &out),
+                bstrides(&a.shape, &out),
+                bstrides(&b.shape, &out),
+            ];
             let cv = c.as_bool();
+            let count = numel(&out);
             match (&a.data, &b.data) {
-                (Data::F32(p), Data::F32(q)) => Tensor::f32(
-                    out,
-                    (0..o[0].len())
-                        .map(|i| if cv[o[0][i]] { p[o[1][i]] } else { q[o[2][i]] })
-                        .collect(),
-                ),
+                (Data::F32(p), Data::F32(q)) => {
+                    let mut v = Vec::with_capacity(count);
+                    walk(&out, &st, |o| {
+                        v.push(if cv[o[0]] { p[o[1]] } else { q[o[2]] })
+                    });
+                    Tensor::f32(out, v)
+                }
                 _ => {
                     let (p, q) = (a.to_i64(), b.to_i64());
-                    Tensor::i64(
-                        out,
-                        (0..o[0].len())
-                            .map(|i| if cv[o[0][i]] { p[o[1][i]] } else { q[o[2][i]] })
-                            .collect(),
-                    )
+                    let mut v = Vec::with_capacity(count);
+                    walk(&out, &st, |o| {
+                        v.push(if cv[o[0]] { p[o[1]] } else { q[o[2]] })
+                    });
+                    Tensor::i64(out, v)
                 }
             }
         }
@@ -658,25 +703,42 @@ pub fn eval(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<Tensor>, String> {
             let mut shape: Vec<usize> = t.shape[..a].to_vec();
             shape.extend(&ind.shape);
             shape.extend(&t.shape[a + 1..]);
-            let s = strides(&t.shape);
-            let is = strides(&ind.shape);
-            let ir = ind.shape.len();
+            // Whole runs of the trailing dimensions are contiguous in both
+            // the input and the output: copy them as slices.
             let dim = t.shape[a] as i64;
-            remap_any(t, shape, |idx| {
-                let io: usize = (0..ir).map(|k| idx[a + k] * is[k]).sum();
-                let mut g = iv[io];
-                if g < 0 {
-                    g += dim;
+            let outer: usize = t.shape[..a].iter().product();
+            let inner: usize = t.shape[a + 1..].iter().product();
+            let mut rows = Vec::with_capacity(iv.len());
+            for &i in &iv {
+                let g = if i < 0 { i + dim } else { i };
+                if !(0..dim).contains(&g) {
+                    return Err(format!("Gather index {i} out of range for axis of {dim}"));
                 }
-                let mut off = g as usize * s[a];
-                for d in 0..a {
-                    off += idx[d] * s[d];
+                rows.push(g as usize);
+            }
+            fn pick<T: Copy>(
+                v: &[T],
+                outer: usize,
+                dim: usize,
+                inner: usize,
+                rows: &[usize],
+            ) -> Vec<T> {
+                let mut out = Vec::with_capacity(outer * rows.len() * inner);
+                for o in 0..outer {
+                    for &g in rows {
+                        let at = (o * dim + g) * inner;
+                        out.extend_from_slice(&v[at..at + inner]);
+                    }
                 }
-                for d in a + 1..r {
-                    off += idx[d + ir - 1] * s[d];
-                }
-                off
-            })
+                out
+            }
+            let d = dim as usize;
+            let _ = r;
+            match &t.data {
+                Data::F32(v) => Tensor::f32(shape, pick(v, outer, d, inner, &rows)),
+                Data::I64(v) => Tensor::i64(shape, pick(v, outer, d, inner, &rows)),
+                Data::Bool(v) => Tensor::bool(shape, pick(v, outer, d, inner, &rows)),
+            }
         }
         "GatherElements" => {
             let (t, ind) = (x(0), x(1));
@@ -698,8 +760,17 @@ pub fn eval(n: &Node, ins: &[Option<&Tensor>]) -> Result<Vec<Tensor>, String> {
             let t = x(0);
             let spec: Vec<usize> = x(1).to_i64().iter().map(|&d| d as usize).collect();
             let out = broadcast_shape(&t.shape, &spec)?;
-            let bs = bstrides(&t.shape, &out);
-            remap_any(t, out, |idx| idx.iter().zip(&bs).map(|(p, q)| p * q).sum())
+            let st = [bstrides(&t.shape, &out)];
+            fn expand<T: Copy>(v: &[T], out: &[usize], st: &[Vec<usize>]) -> Vec<T> {
+                let mut r = Vec::with_capacity(numel(out));
+                walk(out, st, |o| r.push(v[o[0]]));
+                r
+            }
+            match &t.data {
+                Data::F32(v) => Tensor::f32(out.clone(), expand(v, &out, &st)),
+                Data::I64(v) => Tensor::i64(out.clone(), expand(v, &out, &st)),
+                Data::Bool(v) => Tensor::bool(out.clone(), expand(v, &out, &st)),
+            }
         }
         "Tile" => {
             let t = x(0);

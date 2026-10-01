@@ -382,6 +382,12 @@ fn run_gpu(
     if has("--tune") {
         opts.mm = kiln::gpu::tune::tune(&plan, device, opts.half, true).unwrap_or_else(|e| die(&e));
     }
+    if has("--tune") && opts.attention {
+        opts.attn = kiln::gpu::tune::tune_attention(&plan, device, opts.half, &opts.mm, true)
+            .unwrap_or_else(|e| die(&e));
+    } else if !has("--no-tune") {
+        opts.attn = kiln::gpu::tune::cached_attention(&plan, device, opts.half);
+    }
     let mut ex = GpuExecutable::build(plan, &opts).unwrap_or_else(|e| die(&e));
     let compile_s = t.elapsed().as_secs_f64();
     let s = &ex.stats;

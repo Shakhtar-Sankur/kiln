@@ -48,8 +48,13 @@ fn check(what: &str, g: &Graph, outs: &HashMap<usize, Tensor>, r: &Reference, to
     }
 }
 
+/// The emulator always (unless KILN_TEST_EMU=0, on a GPU machine with
+/// few cores), and a real GPU when there is one.
 fn devices() -> Vec<Device> {
-    let mut d = vec![Device::Emu];
+    let mut d = Vec::new();
+    if std::env::var("KILN_TEST_EMU").as_deref() != Ok("0") {
+        d.push(Device::Emu);
+    }
     match kiln::gpu::driver::Cuda::open() {
         Ok(c) => {
             eprintln!("also testing on {}", c.name);
@@ -152,6 +157,10 @@ fn gpu_tensor_core_kernels_match_pytorch_with_each_optimization_off() {
 
 #[test]
 fn gpu_kernels_compile_for_t4_and_a100() {
+    if std::env::var("KILN_TEST_EMU").as_deref() == Ok("0") {
+        eprintln!("skipped: compile checks run with the emulator tests");
+        return;
+    }
     let nv = match kiln::gpu::driver::Nvrtc::open() {
         Ok(nv) => nv,
         Err(e) => {
@@ -210,6 +219,24 @@ fn fused_attention_applies_and_matches_pytorch() {
                 run(m, FuseOpts::default(), dev, |_, opts| {
                     opts.attention = attention
                 });
+            }
+            // Every fused shape the tuner may choose, in both precisions.
+            for p in kiln::gpu::attention::space() {
+                for half in [false, true] {
+                    run(m, FuseOpts::default(), dev, |plan, opts| {
+                        opts.half = half;
+                        for [a, _, c] in kiln::gpu::attention::find(plan) {
+                            if let (
+                                Step::Kernel(Kernel::Matmul(m1)),
+                                Step::Kernel(Kernel::Matmul(m3)),
+                            ) = (&plan.steps[a], &plan.steps[c])
+                            {
+                                opts.attn
+                                    .insert(kiln::gpu::attention::key(m1, m3, half), Some(p));
+                            }
+                        }
+                    });
+                }
             }
             // Fusion off leaves no softmax row kernel to absorb.
             run(

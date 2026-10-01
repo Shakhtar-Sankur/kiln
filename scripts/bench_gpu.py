@@ -105,14 +105,14 @@ def main():
                 out = np.asarray(run())
                 report("jax/xla", out, *timeit(run, lambda: None, a.iters), dev_name)
     if "ort" in engines:
-        import onnxruntime as ort
-        if "CUDAExecutionProvider" not in ort.get_available_providers():
-            print(f"{a.name} ort: skipped, no CUDAExecutionProvider")
-        else:
+        try:
+            import onnxruntime as ort
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             s = ort.InferenceSession(os.path.join(a.models, a.name + ".onnx"), so,
                                      providers=["CUDAExecutionProvider"])
+            if "CUDAExecutionProvider" not in s.get_providers():
+                raise RuntimeError("CUDAExecutionProvider unavailable (" + ", ".join(s.get_providers()) + ")")
             io = s.io_binding()
             for n, v in feeds.items():
                 io.bind_ortvalue_input(n, ort.OrtValue.ortvalue_from_numpy(v, "cuda", 0))
@@ -122,6 +122,8 @@ def main():
             run()
             out = io.copy_outputs_to_cpu()[0]
             report("onnxruntime", out, *timeit(run, io.synchronize_outputs, a.iters), dev_name)
+        except Exception as e:  # noqa: BLE001 - report and keep the other engines' results
+            print(f"{a.name} onnxruntime: skipped, {str(e).splitlines()[0][:200]}")
     if a.json:
         with open(a.json, "a") as f:
             for r in results:
