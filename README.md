@@ -7,21 +7,48 @@ with the system C compiler, auto-tunes the matrix multiplies on the machine
 it runs on, and executes the result: the pipeline of XLA, TVM or
 torch.compile's Inductor, end to end.
 
-On real models it is checked against PyTorch, and on a 4-vCPU machine it
-is faster than ONNX Runtime, PyTorch and JAX/XLA, and level with
-torch.compile:
+Its output matches PyTorch's, and on a 4-vCPU machine it runs BERT,
+SmolLM2-135M and an MLP faster than torch.compile, ONNX Runtime, JAX/XLA
+and PyTorch:
 
-@@HEADLINE@@
+| Median latency, 4 threads | **kiln** | torch.compile | ONNX Runtime | JAX / XLA | PyTorch |
+|---|---|---|---|---|---|
+| BERT (bge-small), 8 × 128 tokens | **126.3 ms** | 133.1 ms | 145.8 ms | 170.3 ms | 179.8 ms |
+| SmolLM2-135M, 128-token prefill | **102.0 ms** | 109.2 ms | 110.5 ms | 126.4 ms | 137.6 ms |
+| MLP, 4 GELU blocks, 64 × 512 | **2.7 ms** | 4.8 ms | 2.9 ms | 4.3 ms | 5.3 ms |
 
 ## Results
 
 ![Latency of kiln, torch.compile, ONNX Runtime, JAX/XLA and PyTorch](docs/latency.svg)
 
-@@TABLE@@
+The margins over the next-fastest engine are 5% (BERT, torch.compile),
+7% (SmolLM2, torch.compile) and 7% (MLP, ONNX Runtime); over JAX/XLA they
+are 24 to 59%, over PyTorch eager 35 to 96%. Each cell is the median of 60
+timings (300 for the MLP) taken in three rounds.
+
+kiln's compiled form of each model:
+
+| | MLP | BERT | SmolLM2-135M |
+|---|---|---|---|
+| ONNX nodes as exported | 54 | 568 | 3,402 |
+| after folding and canonicalization | 76 | 674 | 1,929 |
+| kernels (distinct C functions) | 12 (3) | 134 (11) | 422 (13) |
+| matmuls with fused epilogues | 8 of 8 | 84 of 96 | 120 of 271 |
+| intermediates / memory-planned arena | 3.3 / 0.8 MB | 381 / 16 MB | 179 / 26 MB |
+
+A matmul keeps a plain store when nothing elementwise reads its product
+at the same index: BERT's attention probabilities times values go straight
+into the next matmul through a head-merging transpose; in SmolLM2 the
+query and key projections are read by rotary embeddings at shifted
+indices (that work goes into row kernels), the value and
+attention-output products feed further matmuls, the gate projection is
+read by the up-projection's epilogue (which computes SiLU(gate) × up), and
+the vocabulary projection is the model's output.
 
 All runs: `bench/run.sh` (rounds interleave every engine so that slow
 periods of the machine hit all of them; the tables are medians of every
-timing, raw data in `bench/results/runs.jsonl`). Machine: 4 vCPUs of an
+timing, raw data in `bench/results/runs.jsonl`, summary in
+`bench/results/summary.md`). Machine: 4 vCPUs of an
 Intel Xeon (Cascade Lake, AVX-512), 15 GB RAM, every engine limited to 4
 threads. Models in float32; the same inputs for every engine, whose output
 is compared with PyTorch's before it is timed. Baselines: ONNX Runtime
@@ -33,17 +60,46 @@ networks written in JAX over the same weights.
 
 ![Latency with each optimization switched off](docs/ablations.svg)
 
-@@ABLATIONS@@
+| Median latency | MLP | BERT | SmolLM2-135M |
+|---|---|---|---|
+| everything | 2.7 ms | 126.3 ms | 102.0 ms |
+| no tuning (a fixed default schedule) | 3.3 ms (1.21×) | 165.5 ms (1.31×) | 127.8 ms (1.25×) |
+| no fusion at all (every node its own kernel) | 3.2 ms (1.18×) | 151.1 ms (1.20×) | 110.6 ms (1.08×) |
+| no batch folding | 2.7 ms (1.00×) | 148.2 ms (1.17×) | 102.1 ms (1.00×) |
+| no epilogue fusion | 2.6 ms (0.95×) | 129.0 ms (1.02×) | 97.9 ms (0.96×) |
+| no row fusion | 2.8 ms (1.02×) | 127.7 ms (1.01×) | 101.6 ms (1.00×) |
+
+Auto-tuning is worth 21 to 31%, fusion as a whole 8 to 20%, and folding
+BERT's batch into one tall matmul 17%. Batch folding cannot apply to the
+MLP or SmolLM2 (no batch dimension shared by a weight): their "no batch
+folding" runs compile to the same code as "everything" and measure 1.00×,
+which calibrates the noise. Switching off epilogue or row fusion *alone*
+changes end-to-end time by less than this machine's run-to-run variation
+(about ±5% here), because the other fusions pick up much of the work: with
+epilogue fusion off, the bias, activation and residual still fuse into row
+kernels. Per kernel, profiling shows the effect directly: the MLP's four
+up-projections take 1.40 ms with GELU fused into them, against 1.27 ms
+plus 0.23 ms for four separate GELU kernels (`--profile`).
 
 ### Compilation
 
-@@COMPILE@@
+With an empty code cache and tuned schedules available, compiling takes
+0.67 s (MLP), 1.19 s (BERT) and 1.68 s (SmolLM2-135M), of which the C
+compiler is 0.57, 1.09 and 1.08 s; identical kernels are compiled once.
+Tuning is a one-time cost per CPU: 22 s, 105 s and 60 s for the matmul
+shapes of the three models.
 
 ## Correctness
 
 | Check | Against | Result |
 |---|---|---|
-@@CORRECTNESS@@
+| ONNX import and the reference interpreter | PyTorch's outputs on the three benchmark models | max difference 2.1e-6 (MLP), 2.7e-7 (BERT), 1.7e-4 (SmolLM2 logits, largest 34.6) |
+| Optimized graph (folding, canonicalization) | the same | the same tolerances |
+| Fused plan, evaluated directly from the kernel IR | PyTorch, tiny MLP, BERT and Llama models (random weights, in CI) | within 1e-5 of the largest output |
+| Generated native code | PyTorch on the benchmark models | 2.1e-6, 2.7e-7, 2.1e-4; for comparison ONNX Runtime differs from PyTorch by 9.5e-7, 2.1e-7, 9.5e-5 |
+| Generated code with each optimization switched off, and under pseudo-random matmul schedules | PyTorch, tiny models, 8- and 16-lane vectors (CI) | within 1e-5 of the largest output |
+| Index simplifier (division factoring, recombination) | integer arithmetic, sampled across each variable's range | identical |
+| Memory planner | 200 random sets of lifetimes | no two live buffers overlap |
 
 ## How it works
 
@@ -55,8 +111,8 @@ constant contents.
 together with constant folding: any node whose inputs are all known, and
 any `Shape` of a value with a known shape, is evaluated at compile time by
 the reference interpreter. With static input shapes, the shape arithmetic
-and mask construction exporters emit disappear (1,593 of SmolLM2's 3,402
-nodes). Canonicalization then rewrites the graph into a small core set:
+exporters emit disappears, and so does any mask that does not depend on
+the inputs, such as SmolLM2's causal mask: 1,593 of SmolLM2's 3,402 nodes. Canonicalization then rewrites the graph into a small core set:
 `Gemm` becomes `MatMul` and `Add`; `Softmax`, `LayerNormalization` and
 `ReduceL2` are decomposed into last-axis reductions and elementwise
 operations (fusion puts them back together as single kernels, as XLA
@@ -137,7 +193,7 @@ python scripts/export_models.py models mlp bert llama
 ./target/release/kiln plan tests/fixtures/llama_tiny.onnx tests/fixtures/llama_tiny.ref --dump
 
 # The benchmark of this README
-bench/run.sh 5 python
+bench/run.sh 3 python
 ```
 
 `--no-epilogue`, `--no-rows`, `--no-inline`, `--no-fold`, `--no-fusion`

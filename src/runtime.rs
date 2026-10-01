@@ -109,6 +109,26 @@ fn pack(
     let src = t.as_f32();
     let np = n.div_ceil(nr);
     let mut out = vec![0f32; np * k * nr];
+    // Plain strides (the usual case): offset = c + sk·k + sj·j.
+    let affine = lin
+        .terms
+        .iter()
+        .all(|(a, _)| matches!(a, crate::ir::Atom::Var(x) if *x == vk || *x == vj));
+    if affine {
+        let (sk, sj) = (lin.coeff(vk).0, lin.coeff(vj).0);
+        for jp in 0..np {
+            for kk in 0..k {
+                let row = &mut out[(jp * k + kk) * nr..(jp * k + kk + 1) * nr];
+                for (jj, o) in row.iter_mut().enumerate() {
+                    let j = jp * nr + jj;
+                    if j < n {
+                        *o = src[(lin.c + sk * kk as i64 + sj * j as i64) as usize];
+                    }
+                }
+            }
+        }
+        return out;
+    }
     let mut env = HashMap::new();
     for jp in 0..np {
         for kk in 0..k {

@@ -9,7 +9,8 @@ const USAGE: &str = "kiln: an ML compiler from ONNX graphs to fused, auto-tuned 
 USAGE:
   kiln interp MODEL.onnx REF.ref     run the reference interpreter, compare with PyTorch
   kiln opt MODEL.onnx REF.ref        optimize the graph, then interpret it and compare
-  kiln plan MODEL.onnx REF.ref       optimize and fuse, evaluate the kernel IR, compare
+  kiln plan MODEL.onnx REF.ref [--dump] [--count]
+                                     optimize and fuse, evaluate the kernel IR, compare
   kiln run MODEL.onnx REF.ref [--threads N] [--iters N] [--tune | --no-tune] [--profile]
                                      [--json FILE --label NAME]
                                      [--no-epilogue] [--no-rows] [--no-inline] [--no-fold] [--no-fusion]
@@ -111,6 +112,22 @@ fn main() {
             eprintln!("plan: {:?}", plan.stats);
             if args.iter().any(|a| a == "--dump") {
                 eprint!("{}", plan.dump());
+            }
+            if args.iter().any(|a| a == "--count") {
+                let mm: Vec<_> = plan
+                    .steps
+                    .iter()
+                    .filter_map(|s| {
+                        if let kiln::fuse::Step::Kernel(kiln::fuse::Kernel::Matmul(m)) = s {
+                            Some(m)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let fused = mm.iter().filter(|m| m.out != m.product).count();
+                println!("matmuls {} with fused epilogue {}", mm.len(), fused);
+                return;
             }
             let t = Instant::now();
             let outs = kiln::eval::run(&plan, &feeds).unwrap_or_else(|e| die(&e));
