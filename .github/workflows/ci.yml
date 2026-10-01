@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - name: tests (vector width chosen for this CPU)
+        run: cargo test --release
+      - name: generated code with 8-lane (AVX2-width) vectors
+        run: KILN_VEC=8 cargo test --release --test models
+      - name: compile and run the tiny models from the command line
+        run: |
+          cargo build --release
+          for m in mlp_tiny bert_tiny llama_tiny; do
+            ./target/release/kiln run tests/fixtures/$m.onnx tests/fixtures/$m.ref --iters 5 | tee -a "$GITHUB_STEP_SUMMARY"
+          done

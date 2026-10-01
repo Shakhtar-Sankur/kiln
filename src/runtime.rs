@@ -67,7 +67,7 @@ pub fn matmul_signature(mk: &crate::fuse::MatmulK) -> String {
 
 /// Offsets for buffers with lifetimes [start, end] (in steps): greedy by
 /// size, each placed at the lowest offset clear of every overlapping one.
-fn plan_memory(bufs: &[(usize, usize, usize, usize)]) -> (HashMap<usize, usize>, usize) {
+pub fn plan_memory(bufs: &[(usize, usize, usize, usize)]) -> (HashMap<usize, usize>, usize) {
     // (value, size, start, end)
     let mut order: Vec<usize> = (0..bufs.len()).collect();
     order.sort_by(|&a, &b| bufs[b].1.cmp(&bufs[a].1).then(bufs[a].2.cmp(&bufs[b].2)));

@@ -44,8 +44,8 @@ def timeit(f, iters):
         t = time.perf_counter()
         f()
         ts.append(time.perf_counter() - t)
-    ts.sort()
-    return ts[len(ts) // 2], ts[0]
+    s = sorted(ts)
+    return s[len(s) // 2], s[0], ts
 
 
 def main():
@@ -62,11 +62,11 @@ def main():
     want = ref["outputs"][0][1]
     results = []
 
-    def report(engine, out, med, best):
+    def report(engine, out, med, best, ts):
         err = float(np.abs(np.asarray(out, dtype=np.float32) - want).max())
         print(f"{a.name} {engine}: median {med * 1e3:.2f} ms, min {best * 1e3:.2f} ms, max |diff| vs reference {err:.2e}")
         results.append({"model": a.name, "engine": engine, "median_ms": med * 1e3, "min_ms": best * 1e3,
-                        "max_diff": err, "threads": a.threads})
+                        "max_diff": err, "threads": a.threads, "times_ms": [round(t * 1e3, 3) for t in ts]})
 
     engines = a.engines.split(",")
     if "ort" in engines:

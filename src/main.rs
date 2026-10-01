@@ -11,8 +11,11 @@ USAGE:
   kiln opt MODEL.onnx REF.ref        optimize the graph, then interpret it and compare
   kiln plan MODEL.onnx REF.ref       optimize and fuse, evaluate the kernel IR, compare
   kiln run MODEL.onnx REF.ref [--threads N] [--iters N] [--tune | --no-tune] [--profile]
+                                     [--json FILE --label NAME]
+                                     [--no-epilogue] [--no-rows] [--no-inline] [--no-fold] [--no-fusion]
                                      compile to native kernels, run, compare, time
-                                     (--tune searches matmul schedules; results are cached)
+                                     (--tune searches matmul schedules; results are cached;
+                                     --no-* switch off one optimization, for ablations)
 ";
 
 fn die(msg: &str) -> ! {
@@ -130,7 +133,15 @@ fn main() {
             let t = Instant::now();
             let mut g = g;
             kiln::passes::optimize(&mut g).unwrap_or_else(|e| die(&e));
-            let plan = kiln::fuse::plan(g).unwrap_or_else(|e| die(&e));
+            let has = |f: &str| args.iter().any(|a| a == f);
+            let none = has("--no-fusion");
+            let fopts = kiln::fuse::FuseOpts {
+                epilogue: !has("--no-epilogue") && !none,
+                rows: !has("--no-rows") && !none,
+                inline: !has("--no-inline") && !none,
+                fold: !has("--no-fold"),
+            };
+            let plan = kiln::fuse::plan_with(g, fopts).unwrap_or_else(|e| die(&e));
             let pstats = plan.stats.clone();
             let params = if args.iter().any(|a| a == "--no-tune") {
                 Default::default()
@@ -145,6 +156,7 @@ fn main() {
                 log: false,
             };
             let mut ex = kiln::runtime::Executable::build(plan, &opts).unwrap_or_else(|e| die(&e));
+            let compile_s = t.elapsed().as_secs_f64();
             let s = &ex.stats;
             eprintln!(
                 "compiled in {:.2} s (C compiler {:.2} s{}): {} kernels ({} distinct, {} lines of C), {} host steps; {pstats:?}",
@@ -194,11 +206,50 @@ fn main() {
                 }
             }
             if !times.is_empty() {
+                let (med, min) = (times[times.len() / 2] * 1e3, times[0] * 1e3);
                 println!(
-                    "latency: median {:.3} ms, min {:.3} ms over {iters} runs, {threads} threads",
-                    times[times.len() / 2] * 1e3,
-                    times[0] * 1e3
+                    "latency: median {med:.3} ms, min {min:.3} ms over {iters} runs, {threads} threads"
                 );
+                if let Some(f) = flag::<String>(&args, "--json") {
+                    let label = flag::<String>(&args, "--label").unwrap_or_else(|| "kiln".into());
+                    let model = Path::new(&args[1])
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    let d = r
+                        .outputs
+                        .iter()
+                        .map(|(name, want)| {
+                            let o = ex
+                                .graph()
+                                .outputs
+                                .iter()
+                                .find(|&&i| &ex.graph().values[i].name == name)
+                                .unwrap();
+                            max_diff(&outs[o], want).0
+                        })
+                        .fold(0f32, f32::max);
+                    let s = &ex.stats;
+                    let line = format!(
+                        r#"{{"model":"{model}","engine":"{label}","median_ms":{med:.3},"min_ms":{min:.3},"max_diff":{d:e},"threads":{threads},"kernels":{},"arena_mb":{:.2},"intermediate_mb":{:.2},"compile_s":{compile_s:.2},"times_ms":[{}]}}"#,
+                        s.kernels,
+                        s.arena_floats as f64 * 4e-6,
+                        s.naive_floats as f64 * 4e-6,
+                        times
+                            .iter()
+                            .map(|t| format!("{:.3}", t * 1e3))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    );
+                    let mut fh = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&f)
+                        .unwrap_or_else(|e| die(&e.to_string()));
+                    use std::io::Write;
+                    writeln!(fh, "{line}").ok();
+                }
             }
         }
         _ => print!("{USAGE}"),

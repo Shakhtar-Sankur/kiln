@@ -411,7 +411,37 @@ fn vars(dims: &[usize], first: Var) -> (Vec<(Var, usize)>, Ranges) {
 /// Largest row-local buffer, in floats.
 const MAX_ROW: usize = 1 << 16;
 
+/// Which optimizations the planner may use (all, by default; switched off
+/// one at a time to measure what each contributes).
+#[derive(Clone, Copy, Debug)]
+pub struct FuseOpts {
+    /// Compute elementwise chains after a matmul in its registers.
+    pub epilogue: bool,
+    /// Group consecutive row operations (reductions, elementwise) into one kernel.
+    pub rows: bool,
+    /// Recompute single-use elementwise values where they are read (off:
+    /// every node writes its result to memory, one kernel per node).
+    pub inline: bool,
+    /// Fold the batch of shared-weight matmuls into their rows.
+    pub fold: bool,
+}
+
+impl Default for FuseOpts {
+    fn default() -> Self {
+        FuseOpts {
+            epilogue: true,
+            rows: true,
+            inline: true,
+            fold: true,
+        }
+    }
+}
+
 pub fn plan(g: Graph) -> Result<Plan, String> {
+    plan_with(g, FuseOpts::default())
+}
+
+pub fn plan_with(g: Graph, opts: FuseOpts) -> Result<Plan, String> {
     let nv = g.values.len();
     let prod = g.producers();
     let class: Vec<Class> = g.nodes.iter().map(|n| classify(&g, n)).collect();
@@ -429,7 +459,7 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
         let o = n.outputs[0];
         root[o] = match class[i] {
             Class::Host | Class::MatMul | Class::Reduce(_) => true,
-            Class::Elem => uses[o] > 1 || is_output[o],
+            Class::Elem => uses[o] > 1 || is_output[o] || !opts.inline,
             Class::Move => is_output[o],
         };
     }
@@ -651,7 +681,7 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
                 // A and the output stay affine in the folded row index.
                 let b_batched = sb.len() > 2 && sb[..sb.len() - 2].iter().any(|&d| d > 1);
                 let nbatch: usize = so[..r - 2].iter().product();
-                let try_fold = !b_batched && nbatch > 1;
+                let try_fold = opts.fold && !b_batched && nbatch > 1;
                 let mut frame = None;
                 for fold in [true, false] {
                     if fold && !try_fold {
@@ -730,6 +760,9 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
                 c.acc = vec![(v, full.clone(), ACC)];
                 loop {
                     let cur = out;
+                    if !opts.epilogue {
+                        break;
+                    }
                     let rd = readers(cur);
                     if is_output[cur] || rd.len() != 1 {
                         break;
@@ -792,13 +825,14 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
             }
             Class::Elem | Class::Reduce(_) => {
                 let (o, w) = row_space(v);
-                let compatible = group.first().is_some_and(|&f| {
-                    let (go, gw) = group
-                        .iter()
-                        .map(|&x| row_space(x))
-                        .fold((row_space(f).0, 1), |acc, (oo, ww)| (oo, acc.1.max(ww)));
-                    go == o && (w == 1 || gw == 1 || w == gw)
-                });
+                let compatible = opts.rows
+                    && group.first().is_some_and(|&f| {
+                        let (go, gw) = group
+                            .iter()
+                            .map(|&x| row_space(x))
+                            .fold((row_space(f).0, 1), |acc, (oo, ww)| (oo, acc.1.max(ww)));
+                        go == o && (w == 1 || gw == 1 || w == gw)
+                    });
                 let avail = deps[&v]
                     .iter()
                     .all(|d| emitted.contains(d) || group.contains(d));
