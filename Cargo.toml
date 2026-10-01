@@ -1,0 +1,17 @@
+[package]
+name = "kiln"
+version = "0.1.0"
+edition = "2024"
+description = "An ML compiler: ONNX graphs to fused, auto-tuned CPU kernels"
+license = "Apache-2.0"
+
+[dependencies]
+
+[profile.release]
+debug = false
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.test]
+opt-level = 3
