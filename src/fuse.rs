@@ -93,6 +93,8 @@ pub struct MatmulK {
     /// A at (batch, vi, vk).
     pub a: E,
     pub b: BOp,
+    /// Temporaries computed in order before `epi` (E::Scalar(id) reads one).
+    pub lets: Vec<(u32, E)>,
     /// The value stored at (batch, vi, vj); E::Scalar(ACC) is the product.
     pub epi: E,
     pub out_idx: Lin,
@@ -177,7 +179,7 @@ struct Ctx<'a> {
     /// The root being defined (expanded rather than loaded).
     expand: Option<usize>,
     /// The matmul product bound to the accumulator, at this index only.
-    acc: Option<(usize, Vec<Lin>)>,
+    acc: Vec<(usize, Vec<Lin>, u32)>,
 }
 
 #[derive(Clone, Copy)]
@@ -201,14 +203,12 @@ fn bcast(idx: &[Lin], out: &[usize], inp: &[usize]) -> Vec<Lin> {
 
 impl Ctx<'_> {
     fn build(&self, v: usize, idx: &[Lin]) -> Result<E, String> {
-        if let Some((m, at)) = &self.acc
-            && *m == v
-        {
+        if let Some((_, at, id)) = self.acc.iter().rev().find(|a| a.0 == v) {
             let shape = self.g.shape(v);
             let same =
                 at.len() == idx.len() && (0..idx.len()).all(|d| shape[d] == 1 || at[d] == idx[d]);
             return if same {
-                Ok(E::Scalar(ACC))
+                Ok(E::Scalar(*id))
             } else {
                 Err("product read at another index".into())
             };
@@ -497,7 +497,7 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
         ranges,
         bind: HashMap::new(),
         expand: None,
-        acc: None,
+        acc: Vec::new(),
     };
 
     // Row space of a root: (outer dims, inner width) of its reduction input
@@ -645,95 +645,130 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
                 );
                 let r = so.len();
                 let (m, nn, k) = (so[r - 2], so[r - 1], sa[sa.len() - 1]);
-                let (batch, mut ranges) = vars(&so[..r - 2], 0);
-                let (vi, vj, vk) = (
-                    batch.len() as Var,
-                    batch.len() as Var + 1,
-                    batch.len() as Var + 2,
-                );
-                ranges.insert(vi, m as i64);
-                ranges.insert(vj, nn as i64);
-                ranges.insert(vk, k as i64);
-                let bidx: Vec<Lin> = batch.iter().map(|&(x, _)| Lin::var(x)).collect();
-                let op_idx = |s: &[usize], x: Var, y: Var| -> Vec<Lin> {
-                    let nb = s.len() - 2;
-                    let mut idx = bcast(&bidx, &so[..r - 2], &s[..nb]);
-                    if nb > bidx.len() {
-                        idx = vec![Lin::konst(0); nb];
+                // Batch folding: when B is shared across the batch (a
+                // weight), the batch dimensions fold into the rows, giving
+                // one tall matmul instead of one per batch element, provided
+                // A and the output stay affine in the folded row index.
+                let b_batched = sb.len() > 2 && sb[..sb.len() - 2].iter().any(|&d| d > 1);
+                let nbatch: usize = so[..r - 2].iter().product();
+                let try_fold = !b_batched && nbatch > 1;
+                let mut frame = None;
+                for fold in [true, false] {
+                    if fold && !try_fold {
+                        continue;
                     }
-                    idx.push(Lin::var(x));
-                    idx.push(Lin::var(y));
-                    idx
-                };
-                let mut c = ctx(ranges.clone());
-                let ae = c.build(a, &op_idx(&sa, vi, vk))?;
-                let be = c.build(b, &op_idx(&sb, vk, vj))?;
+                    let (batch, mut ranges) = if fold {
+                        (Vec::new(), Ranges::new())
+                    } else {
+                        vars(&so[..r - 2], 0)
+                    };
+                    let (vi, vj, vk) = (
+                        batch.len() as Var,
+                        batch.len() as Var + 1,
+                        batch.len() as Var + 2,
+                    );
+                    let m_eff = if fold { nbatch * m } else { m };
+                    ranges.insert(vi, m_eff as i64);
+                    ranges.insert(vj, nn as i64);
+                    ranges.insert(vk, k as i64);
+                    // The output index (batch..., i, j) in terms of the loop variables.
+                    let mut full: Vec<Lin> = if fold {
+                        delinearize(&Lin::var(vi), &so[..r - 1], &ranges)
+                    } else {
+                        (0..r - 1).map(|d| Lin::var(d as Var)).collect()
+                    };
+                    full.push(Lin::var(vj));
+                    let bidx: Vec<Lin> = full[..r - 2].to_vec();
+                    let op_idx = |s: &[usize], x: Lin, y: Lin| -> Vec<Lin> {
+                        let nb = s.len() - 2;
+                        let mut idx = if nb <= bidx.len() {
+                            bcast(&bidx, &so[..r - 2], &s[..nb])
+                        } else {
+                            vec![Lin::konst(0); nb]
+                        };
+                        idx.push(x);
+                        idx.push(y);
+                        idx
+                    };
+                    let c = ctx(ranges.clone());
+                    let ae = c.build(a, &op_idx(&sa, full[r - 2].clone(), Lin::var(vk)))?;
+                    let be = c.build(b, &op_idx(&sb, Lin::var(vk), Lin::var(vj)))?;
+                    let affine = |e: &E| match e {
+                        E::Load(_, l) => !l.coeff(vi).1,
+                        _ => false,
+                    };
+                    let out_ok = !linearize(&full, &so).coeff(vi).1;
+                    if fold && !(affine(&ae) && out_ok) {
+                        continue;
+                    }
+                    frame = Some((batch, vi, vj, vk, ranges, full, m_eff, ae, be, c));
+                    break;
+                }
+                let (batch, vi, vj, vk, ranges, full, m_eff, ae, be, mut c) = frame.unwrap();
+                let bvars: Vec<Var> = batch.iter().map(|b| b.0).collect();
                 let bop = match &be {
-                    E::Load(Buf::Value(cv), lin) if g.konst(*cv).is_some() && bidx.iter().all(|l| {
-                        l.terms.iter().all(|(at, _)| !matches!(at, crate::ir::Atom::Var(x) if lin.mentions(*x)))
-                    }) =>
+                    E::Load(Buf::Value(cv), lin)
+                        if g.konst(*cv).is_some() && bvars.iter().all(|x| !lin.mentions(*x)) =>
                     {
-                        BOp::Packed { value: *cv, lin: lin.clone() }
+                        BOp::Packed {
+                            value: *cv,
+                            lin: lin.clone(),
+                        }
                     }
                     _ => BOp::Expr(be),
                 };
-                // Epilogue fusion: the single elementwise root reading the
-                // product, if every path from the product leads to it and
-                // its other inputs already exist.
+                let m = m_eff;
+                // Epilogue fusion, repeated along a chain: while the current
+                // value has a single reader, an elementwise root of the same
+                // shape whose other inputs already exist and which reads it
+                // only at the output index, that root is computed in
+                // registers too. Intermediate links become temporaries.
                 let mut out = v;
+                let mut lets: Vec<(u32, E)> = Vec::new();
                 let mut epi = E::Scalar(ACC);
-                let readers_v = readers(v);
-                if std::env::var("KILN_DEBUG_FUSE").is_ok() {
-                    eprintln!(
-                        "epi? {} readers {:?}",
-                        g.values[v].name,
-                        readers_v
-                            .iter()
-                            .map(|&x| (
-                                &g.values[x].name,
-                                deps[&x]
-                                    .iter()
-                                    .map(|d| (&g.values[*d].name, emitted.contains(d)))
-                                    .collect::<Vec<_>>()
-                            ))
-                            .collect::<Vec<_>>()
-                    );
-                }
-                if !is_output[v] && readers_v.len() == 1 {
-                    let rr = readers_v[0];
+                let mut chain: Vec<usize> = vec![v];
+                c.acc = vec![(v, full.clone(), ACC)];
+                loop {
+                    let cur = out;
+                    let rd = readers(cur);
+                    if is_output[cur] || rd.len() != 1 {
+                        break;
+                    }
+                    let rr = rd[0];
                     let rp = prod[rr].unwrap();
                     let ok_class = class[rp] == Class::Elem && g.shape(rr) == so.as_slice();
-                    let deps_ok = deps[&rr].iter().all(|d| *d == v || emitted.contains(d));
+                    let deps_ok = deps[&rr]
+                        .iter()
+                        .all(|d| chain.contains(d) || emitted.contains(d));
                     let direct_other = g.nodes.iter().enumerate().any(|(ni, nd)| {
-                        nd.inputs.iter().flatten().any(|&u| u == v)
+                        nd.inputs.iter().flatten().any(|&u| u == cur)
                             && !(class[ni] == Class::Elem || class[ni] == Class::Move)
                     });
-                    if std::env::var("KILN_DEBUG_FUSE").is_ok() {
-                        eprintln!(
-                            "  ok_class {ok_class} deps_ok {deps_ok} direct_other {direct_other} shape {:?} vs {:?}",
-                            g.shape(rr),
-                            so
-                        );
+                    if !(ok_class && deps_ok && !direct_other) {
+                        break;
                     }
-                    if ok_class && deps_ok && !direct_other {
-                        let full: Vec<Lin> = (0..r).map(|d| Lin::var(d as Var)).collect();
-                        c.acc = Some((v, full.clone()));
+                    c.expand = Some(rr);
+                    let res = c.expand_node(rp, &full);
+                    c.expand = None;
+                    let Ok(e) = res else { break };
+                    if cur != v {
+                        // The previous link becomes a temporary.
+                        let id = lets.len() as u32;
+                        lets.push((id, std::mem::replace(&mut epi, E::Scalar(ACC))));
+                        c.acc.push((cur, full.clone(), id));
+                        // Re-expand now that `cur` is bound to the temporary.
                         c.expand = Some(rr);
-                        let res = c.expand_node(rp, &full);
-                        if std::env::var("KILN_DEBUG_FUSE").is_ok() {
-                            eprintln!("  expand: {:?}", res.as_ref().err());
-                        }
-                        if let Ok(e) = res {
-                            out = rr;
-                            epi = e;
-                            fused.insert(rr);
-                            st_epi += 1;
-                        }
-                        c.acc = None;
+                        epi = c.expand_node(rp, &full)?;
                         c.expand = None;
+                    } else {
+                        epi = e;
                     }
+                    fused.insert(rr);
+                    chain.push(rr);
+                    out = rr;
+                    st_epi += 1;
                 }
-                let full: Vec<Lin> = (0..r).map(|d| Lin::var(d as Var)).collect();
+                c.acc.clear();
                 let out_idx = linearize(&full, &so);
                 steps.push(Step::Kernel(Kernel::Matmul(Box::new(MatmulK {
                     out,
@@ -746,6 +781,7 @@ pub fn plan(g: Graph) -> Result<Plan, String> {
                     vk,
                     a: ae,
                     b: bop,
+                    lets,
                     epi,
                     out_idx,
                     ranges,
@@ -855,6 +891,7 @@ impl Plan {
                 }
                 Step::Kernel(Kernel::Matmul(m)) => {
                     let mut es = vec![&m.a, &m.epi];
+                    es.extend(m.lets.iter().map(|l| &l.1));
                     if let BOp::Expr(e) = &m.b {
                         es.push(e);
                     }

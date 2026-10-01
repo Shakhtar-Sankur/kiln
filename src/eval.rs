@@ -225,6 +225,10 @@ pub fn run(plan: &Plan, feeds: &Feeds) -> Result<HashMap<usize, Tensor>, String>
                         acc += a * b;
                     }
                     env.scalars.insert(ACC, acc);
+                    for (id, e) in &mk.lets {
+                        let x = env.e(e);
+                        env.scalars.insert(*id, x);
+                    }
                     out[env.at(&mk.out_idx)] = env.e(&mk.epi);
                 });
                 vals.insert(mk.out, out);

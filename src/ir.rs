@@ -59,6 +59,27 @@ impl Lin {
             }
         }
         out.retain(|t| t.1 != 0);
+        // Recombine a·(x / d) + b·(x mod d) with a = b·d into b·x.
+        let mut i = 0;
+        while i < out.len() {
+            if let (Atom::Div(x, d), a) = (&out[i].0, out[i].1)
+                && let Some(j) = out.iter().position(|(t, b)| {
+                    matches!(t, Atom::Mod(y, e) if y == x && e == d) && a == b * d
+                })
+            {
+                let (x, b) = ((**x).clone(), out[j].1);
+                let (hi, lo) = if i > j { (i, j) } else { (j, i) };
+                out.remove(hi);
+                out.remove(lo);
+                let mut rest = Lin {
+                    c: self.c,
+                    terms: out,
+                };
+                rest = rest.add(&x.scale(b));
+                return rest;
+            }
+            i += 1;
+        }
         self.terms = out;
         self
     }
@@ -126,6 +147,28 @@ impl Lin {
         (q.normalize(), r.normalize())
     }
 
+    /// A divisor `d` of `k` (d > 1) such that self = d·Q + R with R in
+    /// [0, d): then floor(self / k) = floor(Q / (k/d)) and
+    /// self mod k = d·(Q mod k/d) + R.
+    fn factor(&self, k: i64, r: &Ranges) -> Option<(i64, Lin, Lin)> {
+        let mut ds: Vec<i64> = self
+            .terms
+            .iter()
+            .map(|(_, c)| gcd(c.abs(), k))
+            .filter(|&d| d > 1 && d < k)
+            .collect();
+        ds.sort_unstable_by(|a, b| b.cmp(a));
+        ds.dedup();
+        for d in ds {
+            let (q, rem) = self.split(d);
+            let (lo, hi) = rem.bounds(r);
+            if lo >= 0 && hi < d {
+                return Some((d, q, rem));
+            }
+        }
+        None
+    }
+
     /// floor(self / k), simplified when the remainder part provably lies in [0, k).
     pub fn div(&self, k: i64, r: &Ranges) -> Lin {
         if k == 1 {
@@ -135,6 +178,9 @@ impl Lin {
         let (lo, hi) = rem.bounds(r);
         if lo >= 0 && hi < k {
             return q;
+        }
+        if let Some((d, q, _)) = self.factor(k, r) {
+            return q.div(k / d, r);
         }
         // Nested division: (x / a) / b = x / (a·b) for non-negative x.
         if self.terms.len() == 1
@@ -160,6 +206,9 @@ impl Lin {
         let (lo, hi) = rem.bounds(r);
         if lo >= 0 && hi < k {
             return rem;
+        }
+        if let Some((d, q, low)) = self.factor(k, r) {
+            return q.rem(k / d, r).scale(d).add(&low);
         }
         Lin::atom(Atom::Mod(Box::new(rem), k))
     }
@@ -266,6 +315,10 @@ impl Atom {
             }
         }
     }
+}
+
+fn gcd(a: i64, b: i64) -> i64 {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// Row-major linear index of `idx` in `shape`.
@@ -404,5 +457,45 @@ mod tests {
         let env: HashMap<Var, i64> = [(0, 50)].into();
         assert_eq!(q.eval(&env), 7);
         assert_eq!(Lin::var(0).rem(7, &x).eval(&env), 1);
+    }
+
+    #[test]
+    fn division_and_remainder_recombine() {
+        // A flattened row index split by delinearize comes back whole.
+        let (i, k) = (0, 1);
+        let r: Ranges = [(i, 1024), (k, 384)].into();
+        let idx = delinearize(&Lin::var(i), &[8, 128], &r);
+        let lin = linearize(
+            &[idx[0].clone(), idx[1].clone(), Lin::var(k)],
+            &[8, 128, 384],
+        );
+        assert_eq!(lin, Lin::var(i).scale(384).add(&Lin::var(k)));
+    }
+
+    #[test]
+    fn grouped_heads_divide_out() {
+        // (8192 h + j + 64 k) / 24576 = h / 3 for j < 64, k < 128.
+        let (h, j, k) = (0, 1, 2);
+        let r: Ranges = [(h, 9), (j, 64), (k, 128)].into();
+        let l = Lin::var(h)
+            .scale(8192)
+            .add(&Lin::var(j))
+            .add(&Lin::var(k).scale(64));
+        assert_eq!(l.div(24576, &r), Lin::var(h).div(3, &r));
+        assert!(!l.div(24576, &r).mentions(j));
+        // And the remainder keeps j and k as plain terms.
+        let m = l.rem(24576, &r);
+        assert_eq!(m.coeff(j), (1, false));
+        // Exhaustive check against integer arithmetic.
+        for hv in 0..9 {
+            for jv in [0, 5, 63] {
+                for kv in [0, 77, 127] {
+                    let env: HashMap<Var, i64> = [(h, hv), (j, jv), (k, kv)].into();
+                    let x = l.eval(&env);
+                    assert_eq!(l.div(24576, &r).eval(&env), x / 24576);
+                    assert_eq!(m.eval(&env), x % 24576);
+                }
+            }
+        }
     }
 }
